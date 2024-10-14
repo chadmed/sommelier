@@ -6,6 +6,7 @@
 
 #include <assert.h>
 #include <cerrno>
+#include <cstdlib>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -13,6 +14,7 @@
 
 #include "aura-shell-client-protocol.h"  // NOLINT(build/include_directory)
 #include "sommelier.h"                   // NOLINT(build/include_directory)
+#include "sommelier-logging.h"           // NOLINT(build/include_directory)
 #include "sommelier-tracing.h"           // NOLINT(build/include_directory)
 
 // TODO(b/173147612): Use container_token rather than this name.
@@ -72,6 +74,18 @@ const char* sl_context_atom_name(int atom_enum) {
       return "_NET_WM_STATE_MAXIMIZED_HORZ";
     case ATOM_NET_WM_STATE_FOCUSED:
       return "_NET_WM_STATE_FOCUSED";
+    case ATOM_NET_WM_WINDOW_TYPE:
+      return "_NET_WM_WINDOW_TYPE";
+    case ATOM_NET_WM_WINDOW_TYPE_NORMAL:
+      return "_NET_WM_WINDOW_TYPE_NORMAL";
+    case ATOM_NET_WM_WINDOW_TYPE_DIALOG:
+      return "_NET_WM_WINDOW_TYPE_DIALOG";
+    case ATOM_NET_WM_WINDOW_TYPE_SPLASH:
+      return "_NET_WM_WINDOW_TYPE_SPLASH";
+    case ATOM_NET_WM_WINDOW_TYPE_UTILITY:
+      return "_NET_WM_WINDOW_TYPE_UTILITY";
+    case ATOM_NET_WM_PID:
+      return "_NET_WM_PID";
     case ATOM_CLIPBOARD:
       return "CLIPBOARD";
     case ATOM_CLIPBOARD_MANAGER:
@@ -88,8 +102,12 @@ const char* sl_context_atom_name(int atom_enum) {
       return "_WL_SELECTION";
     case ATOM_GTK_THEME_VARIANT:
       return "_GTK_THEME_VARIANT";
+    case ATOM_STEAM_GAME:
+      return "STEAM_GAME";
     case ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS:
       return "_XWAYLAND_RANDR_EMU_MONITOR_RECTS";
+    case ATOM_SOMMELIER_QUIRK_APPLIED:
+      return "SOMMELIER_QUIRK_APPLIED";
   }
   return nullptr;
 }
@@ -113,6 +131,7 @@ void sl_context_init_default(struct sl_context* ctx) {
   ctx->text_input_manager = nullptr;
   ctx->text_input_extension = nullptr;
   ctx->xdg_output_manager = nullptr;
+  ctx->fractional_scale_manager = nullptr;
 #ifdef GAMEPAD_SUPPORT
   ctx->gaming_input_manager = nullptr;
   ctx->gaming_seat = nullptr;
@@ -158,6 +177,9 @@ void sl_context_init_default(struct sl_context* ctx) {
   ctx->dark_frame_color = 0xff000000;
   ctx->support_damage_buffer = true;
   ctx->fullscreen_mode = ZAURA_SURFACE_FULLSCREEN_MODE_IMMERSIVE;
+  ctx->allow_xwayland_emulate_screen_pos_size = false;
+  ctx->ignore_stateless_toplevel_configure = false;
+  ctx->only_client_can_exit_fullscreen = false;
   ctx->default_seat = nullptr;
   ctx->selection_window = XCB_WINDOW_NONE;
   ctx->selection_owner = XCB_WINDOW_NONE;
@@ -182,14 +204,18 @@ void sl_context_init_default(struct sl_context* ctx) {
   }
   ctx->timing = nullptr;
   ctx->trace_filename = nullptr;
+#ifdef QUIRKS_SUPPORT
+  new (&ctx->quirks) Quirks();
+#endif
   ctx->enable_xshape = false;
   ctx->enable_x11_move_windows = false;
   ctx->trace_system = false;
   ctx->use_direct_scale = false;
   ctx->stable_scaling = false;
+  ctx->frame_stats = nullptr;
+  ctx->stats_timer_delay = 60 * 1000;
+  ctx->viewport_resize = false;
 
-  wl_list_init(&ctx->accelerators);
-  wl_list_init(&ctx->windowed_accelerators);
   wl_list_init(&ctx->registries);
   wl_list_init(&ctx->globals);
   wl_list_init(&ctx->outputs);
@@ -215,7 +241,7 @@ static int sl_handle_clipboard_event(int fd, uint32_t mask, void* data) {
 
   rv = ctx->channel->handle_pipe(fd, readable, hang_up);
   if (rv) {
-    fprintf(stderr, "reading pipe failed with %s\n", strerror(rv));
+    LOG(ERROR) << "reading pipe failed with " << strerror(rv);
     return 0;
   }
 
@@ -241,11 +267,9 @@ static int sl_handle_wayland_channel_event(int fd, uint32_t mask, void* data) {
   int rv;
 
   if (!(mask & WL_EVENT_READABLE)) {
-    fprintf(stderr,
-            "Got error or hangup on virtwl ctx fd"
-            " (mask %d), exiting\n",
-            mask);
-    exit(EXIT_SUCCESS);
+    LOG(FATAL) << "Got error or hangup on virtwl ctx fd (mask " << mask
+               << "), exiting";
+    exit(EXIT_FAILURE);
   }
 
   receive.channel_fd = fd;
@@ -315,11 +339,9 @@ static int sl_handle_virtwl_socket_event(int fd, uint32_t mask, void* data) {
   int rv;
 
   if (!(mask & WL_EVENT_READABLE)) {
-    fprintf(stderr,
-            "Got error or hangup on virtwl socket"
-            " (mask %d), exiting\n",
-            mask);
-    exit(EXIT_SUCCESS);
+    LOG(FATAL) << "Got error or hangup on virtwl socket (mask " << mask
+               << "), exiting";
+    exit(EXIT_FAILURE);
   }
 
   buffer_iov.iov_base = data_buffer;
@@ -365,48 +387,60 @@ static int sl_handle_virtwl_socket_event(int fd, uint32_t mask, void* data) {
   return 1;
 }
 
-bool sl_context_init_wayland_channel(struct sl_context* ctx,
-                                     struct wl_event_loop* event_loop,
-                                     bool display) {
-  if (ctx->channel == nullptr) {
-    // Running in noop mode, without virtualization.
-    return true;
+wl_event_loop* sl_context_configure_event_loop(sl_context* ctx,
+                                               WaylandChannel* channel,
+                                               bool use_virtual_context) {
+  assert(ctx);
+  // caller must provide a wayland channel to use virtual context
+  assert(!use_virtual_context || channel);
+
+  wl_display* host_display = wl_display_create();
+  if (!host_display) {
+    LOG(ERROR) << "failed to create host wayland display.";
+    return nullptr;
   }
-  int rv = ctx->channel->init();
-  if (rv) {
-    fprintf(stderr, "error: could not initialize wayland channel: %s\n",
-            strerror(-rv));
-    return false;
-  }
-  if (!display) {
-    // We use a wayland virtual context unless display was explicitly specified.
+  // libwayland ensures event_loop can be retrieved from a valid display, but
+  // assert such in case that assumption ever changes.
+  wl_event_loop* event_loop = wl_display_get_event_loop(host_display);
+  assert(event_loop);
+
+  int wayland_channel_fd = -1;
+  if (channel && use_virtual_context) {
     // WARNING: It's critical that we never call wl_display_roundtrip
     // as we're not spawning a new thread to handle forwarding. Calling
     // wl_display_roundtrip will cause a deadlock.
-    int vws[2];
+    int ret;
+
+    ret = channel->create_context(wayland_channel_fd);
+    if (ret) {
+      LOG(ERROR) << "failed to create virtwl context: " << strerror(-ret);
+      return nullptr;
+    }
 
     // Connection to virtwl channel.
-    rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, vws);
-    errno_assert(!rv);
+    int vws[2];
+    ret = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, vws);
+    if (ret) {
+      LOG(ERROR) << "failed to create wayland channel socket pair: "
+                 << strerror(errno);
+      return nullptr;
+    }
 
     ctx->virtwl_socket_fd = vws[0];
     ctx->virtwl_display_fd = vws[1];
 
-    rv = ctx->channel->create_context(ctx->wayland_channel_fd);
-    if (rv) {
-      fprintf(stderr, "error: failed to create virtwl context: %s\n",
-              strerror(-rv));
-      return false;
-    }
-
     ctx->virtwl_socket_event_source.reset(wl_event_loop_add_fd(
         event_loop, ctx->virtwl_socket_fd, WL_EVENT_READABLE,
         sl_handle_virtwl_socket_event, ctx));
-    ctx->wayland_channel_event_source.reset(wl_event_loop_add_fd(
-        event_loop, ctx->wayland_channel_fd, WL_EVENT_READABLE,
-        sl_handle_wayland_channel_event, ctx));
+    ctx->wayland_channel_event_source.reset(
+        wl_event_loop_add_fd(event_loop, wayland_channel_fd, WL_EVENT_READABLE,
+                             sl_handle_wayland_channel_event, ctx));
   }
-  return true;
+
+  ctx->host_display = host_display;
+  ctx->channel = channel;
+  ctx->wayland_channel_fd = wayland_channel_fd;
+  return event_loop;
 }
 
 sl_window* sl_context_lookup_window_for_surface(struct sl_context* ctx,

@@ -1,6 +1,6 @@
 # Gamepad support in Sommelier
 
-When `GAMEPAD_SUPPORT` is enabled, [Sommelier](https://crsrc.org/o/src/platform2/vm_tools/sommelier/testing/sommelier-gaming.cc)
+When `GAMEPAD_SUPPORT` is enabled, [Sommelier](https://crsrc.org/o/src/platform2/vm_tools/sommelier/sommelier-gaming.cc)
 will create a gaming seat to listen for gamepads being attached and their associated events.
 
 Once a gamepad is added, we use `evdev` and `uinput` to emulate an Xbox One S gamepad in the VM. We subsequently forward
@@ -16,7 +16,7 @@ with each input on your gamepad.
      2. Run `evtest` and select your device
      3. Copy the ID values from the “Input device ID” section
      4. Press/use each input on your device and note what input event code values evtest observes
-3. Add your mapping to [sommelier-gaming](https://crsrc.org/o/src/platform2/vm_tools/sommelier/testing/sommelier-gaming.cc)
+3. Add your mapping to [sommelier-gaming](https://crsrc.org/o/src/platform2/vm_tools/sommelier/sommelier-gaming.cc)
    1. Create a `DeviceID` struct with the details of your gamepad
    2. Create (or reuse) a mapping for your gamepad
    3. Add the `DeviceID`/mapping pair to `kDeviceMappings`
@@ -24,6 +24,7 @@ with each input on your gamepad.
 To figure out what the mapping should be, you can follow the reference table below which demonstrates which event codes are mapped to which buttons on an Xbox gamepad (which we emulate) - we suggest making the mappings locality focused, rather than glyph-focused (i.e bottom face button should map to the Xbox “A”).
 
 Xbox One S gamepad button-event code mapping:
+
 | Button/axes      | Input code           |
 | -----------------|----------------------|
 | left joystick    | ABS_X, ABX_Y         |

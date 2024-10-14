@@ -2,16 +2,25 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "sommelier.h"            // NOLINT(build/include_directory)
-#include "sommelier-tracing.h"    // NOLINT(build/include_directory)
-#include "sommelier-transform.h"  // NOLINT(build/include_directory)
-#include "sommelier-xshape.h"     // NOLINT(build/include_directory)
+#include "compositor/sommelier-linux-dmabuf.h"  // NOLINT(build/include_directory)
+#include "sommelier.h"  // NOLINT(build/include_directory)
+#include <cstdint>
+#include <cstring>
+#include "sommelier-logging.h"      // NOLINT(build/include_directory)
+#include "sommelier-scope-timer.h"  // NOLINT(build/include_directory)
+#include "sommelier-tracing.h"      // NOLINT(build/include_directory)
+#include "sommelier-transform.h"    // NOLINT(build/include_directory)
+#include "sommelier-window.h"       // NOLINT(build/include_directory)
+#include "sommelier-xdg-shell.h"    // NOLINT(build/include_directory)
+#include "sommelier-xshape.h"       // NOLINT(build/include_directory)
 #ifdef GAMEPAD_SUPPORT
 #include "libevdev/libevdev-shim.h"
 #endif
+#include "viewporter-shim.h"  // NOLINT(build/include_directory)
 #include "xcb/xcb-shim.h"
 
 #include <assert.h>
+#include <cstdlib>
 #include <errno.h>
 #include <fcntl.h>
 #include <gbm.h>
@@ -31,6 +40,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 #include <wayland-client.h>
 #include <xcb/composite.h>
 #include <xcb/shape.h>
@@ -40,9 +50,11 @@
 
 #include "aura-shell-client-protocol.h"  // NOLINT(build/include_directory)
 #include "drm-server-protocol.h"         // NOLINT(build/include_directory)
+#include "fractional-scale-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #ifdef GAMEPAD_SUPPORT
 #include "gaming-input-unstable-v2-client-protocol.h"  // NOLINT(build/include_directory)
 #endif
+#include "idle-inhibit-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #include "keyboard-extension-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #include "linux-dmabuf-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #include "linux-explicit-synchronization-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
@@ -55,6 +67,10 @@
 #include "xdg-output-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #include "xdg-shell-client-protocol.h"  // NOLINT(build/include_directory)
 #include "xdg-shell-shim.h"             // NOLINT(build/include_directory)
+
+#ifdef QUIRKS_SUPPORT
+#include "quirks/sommelier-quirks.h"
+#endif
 
 // Check that required macro definitions exist.
 #ifndef XWAYLAND_PATH
@@ -95,48 +111,12 @@ struct sl_data_source {
 #define MIN_AURA_SHELL_VERSION 6
 #define MAX_AURA_SHELL_VERSION 38
 
+static const char STEAM_APP_CLASS_PREFIX[] = "steam_app_";
+
 int sl_open_wayland_socket(const char* socket_name,
                            struct sockaddr_un* addr,
                            int* lock_fd,
                            int* sock_fd);
-
-int sl_shm_format_for_drm_format(uint32_t drm_format) {
-  switch (drm_format) {
-    case WL_DRM_FORMAT_NV12:
-      return WL_SHM_FORMAT_NV12;
-    case WL_DRM_FORMAT_RGB565:
-      return WL_SHM_FORMAT_RGB565;
-    case WL_DRM_FORMAT_ARGB8888:
-      return WL_SHM_FORMAT_ARGB8888;
-    case WL_DRM_FORMAT_ABGR8888:
-      return WL_SHM_FORMAT_ABGR8888;
-    case WL_DRM_FORMAT_XRGB8888:
-      return WL_SHM_FORMAT_XRGB8888;
-    case WL_DRM_FORMAT_XBGR8888:
-      return WL_SHM_FORMAT_XBGR8888;
-  }
-  assert(0);
-  return 0;
-}
-
-uint32_t sl_drm_format_for_shm_format(int format) {
-  switch (format) {
-    case WL_SHM_FORMAT_NV12:
-      return WL_DRM_FORMAT_NV12;
-    case WL_SHM_FORMAT_RGB565:
-      return WL_DRM_FORMAT_RGB565;
-    case WL_SHM_FORMAT_ARGB8888:
-      return WL_DRM_FORMAT_ARGB8888;
-    case WL_SHM_FORMAT_ABGR8888:
-      return WL_DRM_FORMAT_ABGR8888;
-    case WL_SHM_FORMAT_XRGB8888:
-      return WL_DRM_FORMAT_XRGB8888;
-    case WL_SHM_FORMAT_XBGR8888:
-      return WL_DRM_FORMAT_XBGR8888;
-  }
-  assert(0);
-  return 0;
-}
 
 const char* net_wm_state_to_string(int i) {
   switch (i) {
@@ -180,9 +160,12 @@ static void sl_adjust_window_size_for_screen_size(struct sl_window* window) {
               window->id);
   struct sl_context* ctx = window->ctx;
 
-  // Clamp size to screen.
-  window->width = MIN(window->width, ctx->screen->width_in_pixels);
-  window->height = MIN(window->height, ctx->screen->height_in_pixels);
+  if (!sl_window_is_containerized(window)) {
+    // Clamp size to screen if the window is not containerized. Containerized
+    // window's size can only be modified by the X11 client.
+    window->width = MIN(window->width, ctx->screen->width_in_pixels);
+    window->height = MIN(window->height, ctx->screen->height_in_pixels);
+  }
 }
 
 static void sl_adjust_window_position_for_screen_size(
@@ -194,8 +177,7 @@ static void sl_adjust_window_position_for_screen_size(
   if (output) {
     window->x =
         output->virt_x + (output->virt_rotated_width - window->width) / 2;
-    window->y =
-        output->virt_y + (output->virt_rotated_height - window->height) / 2;
+    window->y = (output->virt_rotated_height - window->height) / 2;
   } else {
     // Center horizontally/vertically.
     window->x = ctx->screen->width_in_pixels / 2 - window->width / 2;
@@ -338,7 +320,7 @@ struct sl_host_buffer* sl_create_host_buffer(struct sl_context* ctx,
   host_buffer->is_drm = is_drm;
 
   return host_buffer;
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_internal_data_offer_destroy(struct sl_data_offer* host) {
   TRACE_EVENT("other", "sl_internal_data_offer_destroy");
@@ -492,6 +474,7 @@ bool sl_client_supports_interface(const sl_context* ctx,
   return strcmp(name, "wl_seat") == 0 ||
          strcmp(name, "zwp_text_input_manager_v1") == 0 ||
          strcmp(name, "zcr_text_input_extension_v1") == 0 ||
+         strcmp(name, "zcr_text_input_crostini_manager_v1") == 0 ||
          strcmp(name, "zcr_text_input_x11_v1") == 0;
 }
 
@@ -623,17 +606,19 @@ void sl_registry_handler(void* data,
     assert(xdg_shell);
     xdg_shell->ctx = ctx;
     xdg_shell->id = id;
+    xdg_shell->version = MIN(SL_XDG_SHELL_MAX_VERSION, version);
     xdg_shell->internal = nullptr;
     xdg_shell->host_global = nullptr;
     assert(!ctx->xdg_shell);
     ctx->xdg_shell = xdg_shell;
     if (ctx->xwayland) {
       xdg_shell->internal = static_cast<xdg_wm_base*>(wl_registry_bind(
-          registry, id, &xdg_wm_base_interface, XDG_SHELL_VERSION));
+          registry, id, &xdg_wm_base_interface, xdg_shell->version));
       xdg_wm_base_add_listener(xdg_shell->internal,
                                &sl_internal_xdg_shell_listener, nullptr);
     } else {
-      xdg_shell->host_global = sl_xdg_shell_global_create(ctx);
+      xdg_shell->host_global =
+          sl_xdg_shell_global_create(ctx, xdg_shell->version);
     }
   } else if (strcmp(interface, "zaura_shell") == 0) {
     if (version >= MIN_AURA_SHELL_VERSION) {
@@ -670,12 +655,21 @@ void sl_registry_handler(void* data,
     assert(linux_dmabuf);
     linux_dmabuf->ctx = ctx;
     linux_dmabuf->id = id;
-    linux_dmabuf->version = MIN(2, version);
-    linux_dmabuf->internal = static_cast<zwp_linux_dmabuf_v1*>(wl_registry_bind(
-        registry, id, &zwp_linux_dmabuf_v1_interface, linux_dmabuf->version));
-    assert(!ctx->linux_dmabuf);
+    linux_dmabuf->version = MIN(SL_LINUX_DMABUF_MAX_VERSION, version);
+
+    linux_dmabuf->host_drm_global = sl_drm_global_create(ctx, linux_dmabuf);
+
+    if (ctx->enable_linux_dmabuf) {
+      linux_dmabuf->host_linux_dmabuf_global =
+          sl_linux_dmabuf_global_create(ctx, linux_dmabuf);
+    }
+
+    if (linux_dmabuf->version >= 2) {
+      linux_dmabuf->proxy_v2 = static_cast<zwp_linux_dmabuf_v1*>(
+          wl_registry_bind(registry, id, &zwp_linux_dmabuf_v1_interface, 2));
+    }
+
     ctx->linux_dmabuf = linux_dmabuf;
-    linux_dmabuf->host_drm_global = sl_drm_global_create(ctx);
   } else if (strcmp(interface, "zwp_linux_explicit_synchronization_v1") == 0) {
     struct sl_linux_explicit_synchronization* linux_explicit_synchronization =
         static_cast<sl_linux_explicit_synchronization*>(
@@ -709,6 +703,8 @@ void sl_registry_handler(void* data,
     text_input_manager->id = id;
     text_input_manager->host_global =
         sl_text_input_manager_global_create(ctx, version);
+    text_input_manager->host_crostini_manager_global =
+        sl_text_input_crostini_manager_global_create(ctx);
     text_input_manager->host_x11_global = sl_text_input_x11_global_create(ctx);
     assert(!ctx->text_input_manager);
     ctx->text_input_manager = text_input_manager;
@@ -771,6 +767,32 @@ void sl_registry_handler(void* data,
         static_cast<zxdg_output_manager_v1*>(wl_registry_bind(
             registry, id, &zxdg_output_manager_v1_interface, MIN(3, version)));
     ctx->xdg_output_manager = output_manager;
+  } else if (strcmp(interface, wp_fractional_scale_manager_v1_interface.name) ==
+             0) {
+    struct sl_fractional_scale_manager* fractional_scale_manager =
+        static_cast<sl_fractional_scale_manager*>(
+            malloc(sizeof(struct sl_fractional_scale_manager)));
+    assert(fractional_scale_manager);
+    fractional_scale_manager->ctx = ctx;
+    fractional_scale_manager->id = id;
+    fractional_scale_manager->host_fractional_scale_manager_global = nullptr;
+    fractional_scale_manager->internal =
+        static_cast<wp_fractional_scale_manager_v1*>(wl_registry_bind(
+            registry, id, &wp_fractional_scale_manager_v1_interface, 1));
+    assert(!ctx->fractional_scale_manager);
+    ctx->fractional_scale_manager = fractional_scale_manager;
+    fractional_scale_manager->host_fractional_scale_manager_global =
+        sl_fractional_scale_manager_global_create(ctx);
+  } else if (strcmp(interface, "zwp_idle_inhibit_manager_v1") == 0) {
+    struct sl_idle_inhibit_manager* idle_inhibit =
+        static_cast<sl_idle_inhibit_manager*>(
+            malloc(sizeof(struct sl_idle_inhibit_manager)));
+    assert(idle_inhibit);
+    idle_inhibit->ctx = ctx;
+    idle_inhibit->id = id;
+    assert(!ctx->idle_inhibit_manager);
+    ctx->idle_inhibit_manager = idle_inhibit;
+    idle_inhibit->host_global = sl_idle_inhibit_manager_global_create(ctx);
   }
 }
 
@@ -845,7 +867,10 @@ void sl_registry_remover(void* data,
   if (ctx->linux_dmabuf && ctx->linux_dmabuf->id == id) {
     if (ctx->linux_dmabuf->host_drm_global)
       sl_global_destroy(ctx->linux_dmabuf->host_drm_global);
-    zwp_linux_dmabuf_v1_destroy(ctx->linux_dmabuf->internal);
+    if (ctx->linux_dmabuf->proxy_v2)
+      zwp_linux_dmabuf_v1_destroy(ctx->linux_dmabuf->proxy_v2);
+    if (ctx->linux_dmabuf->host_linux_dmabuf_global)
+      sl_global_destroy(ctx->linux_dmabuf->host_linux_dmabuf_global);
     free(ctx->linux_dmabuf);
     ctx->linux_dmabuf = nullptr;
     return;
@@ -900,6 +925,12 @@ void sl_registry_remover(void* data,
     sl_global_destroy(ctx->pointer_constraints->host_global);
     free(ctx->pointer_constraints);
     ctx->pointer_constraints = nullptr;
+    return;
+  }
+  if (ctx->idle_inhibit_manager && ctx->idle_inhibit_manager->id == id) {
+    sl_global_destroy(ctx->idle_inhibit_manager->host_global);
+    free(ctx->idle_inhibit_manager);
+    ctx->idle_inhibit_manager = nullptr;
     return;
   }
   wl_list_for_each(output, &ctx->outputs, link) {
@@ -1088,12 +1119,24 @@ static const char* sl_decode_wm_class(struct sl_window* window,
   // WM_CLASS property contains two consecutive null-terminated strings.
   // These specify the Instance and Class names. If a global app ID is
   // not set then use Class name for app ID.
-  const char* value = static_cast<char*>(xcb_get_property_value(reply));
-  int value_length = xcb_get_property_value_length(reply);
+  const char* value = static_cast<char*>(xcb()->get_property_value(reply));
+  int value_length = xcb()->get_property_value_length(reply);
   int instance_length = strnlen(value, value_length);
   if (value_length > instance_length) {
     window->clazz = strndup(value + instance_length + 1,
                             value_length - instance_length - 1);
+
+    if (!window->steam_game_id) {
+      // If there's no known Steam Game ID for this window,
+      // attempt to parse one from the class name.
+      if (strncmp(window->clazz, STEAM_APP_CLASS_PREFIX,
+                  strlen(STEAM_APP_CLASS_PREFIX)) == 0) {
+        // atoi() returns 0 on error, in which case steam_game_id
+        // simply remains effectively unset.
+        window->steam_game_id =
+            atoi(window->clazz + strlen(STEAM_APP_CLASS_PREFIX));
+      }
+    }
     return window->clazz;
   }
   return nullptr;
@@ -1103,8 +1146,19 @@ static void sl_set_application_id_from_atom(struct sl_context* ctx,
                                             struct sl_window* window,
                                             xcb_get_property_reply_t* reply) {
   if (reply->type == XCB_ATOM_CARDINAL) {
-    uint32_t value = *static_cast<uint32_t*>(xcb_get_property_value(reply));
+    uint32_t value = *static_cast<uint32_t*>(xcb()->get_property_value(reply));
     window->app_id_property = std::to_string(value);
+  }
+}
+
+static void on_steam_game_id_updated(struct sl_context* ctx,
+                                     struct sl_window* window,
+                                     xcb_get_property_reply_t* reply) {
+  if (reply->type == XCB_ATOM_CARDINAL) {
+    window->steam_game_id =
+        *static_cast<uint32_t*>(xcb()->get_property_value(reply));
+  } else {
+    window->steam_game_id = 0;
   }
 }
 
@@ -1131,7 +1185,10 @@ void sl_handle_map_request(struct sl_context* ctx,
       {PROPERTY_GTK_THEME_VARIANT, ctx->atoms[ATOM_GTK_THEME_VARIANT].value},
       {PROPERTY_XWAYLAND_RANDR_EMU_MONITOR_RECTS,
        ctx->atoms[ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS].value},
+      {PROPERTY_STEAM_GAME, ctx->atoms[ATOM_STEAM_GAME].value},
       {PROPERTY_SPECIFIED_FOR_APP_ID, ctx->application_id_property_atom},
+      {PROPERTY_NET_WM_WINDOW_TYPE, ctx->atoms[ATOM_NET_WM_WINDOW_TYPE].value},
+      {PROPERTY_NET_WM_PID, ctx->atoms[ATOM_NET_WM_PID].value},
   };
   xcb_get_geometry_cookie_t geometry_cookie;
   xcb_get_property_cookie_t property_cookies[ARRAY_SIZE(properties)];
@@ -1148,17 +1205,17 @@ void sl_handle_map_request(struct sl_context* ctx,
 
   window->managed = 1;
   if (window->frame_id == XCB_WINDOW_NONE)
-    geometry_cookie = xcb_get_geometry(ctx->connection, window->id);
+    geometry_cookie = xcb()->get_geometry(ctx->connection, window->id);
 
   for (unsigned i = 0; i < ARRAY_SIZE(properties); ++i) {
     property_cookies[i] =
-        xcb_get_property(ctx->connection, 0, window->id, properties[i].atom,
-                         XCB_ATOM_ANY, 0, 2048);
+        xcb()->get_property(ctx->connection, 0, window->id, properties[i].atom,
+                            XCB_ATOM_ANY, 0, 2048);
   }
 
   if (window->frame_id == XCB_WINDOW_NONE) {
     xcb_get_geometry_reply_t* geometry_reply =
-        xcb_get_geometry_reply(ctx->connection, geometry_cookie, nullptr);
+        xcb()->get_geometry_reply(ctx->connection, geometry_cookie, nullptr);
     if (geometry_reply) {
       window->x = geometry_reply->x;
       window->y = geometry_reply->y;
@@ -1182,8 +1239,8 @@ void sl_handle_map_request(struct sl_context* ctx,
   window->dark_frame = 0;
 
   for (unsigned i = 0; i < ARRAY_SIZE(properties); ++i) {
-    xcb_get_property_reply_t* reply =
-        xcb_get_property_reply(ctx->connection, property_cookies[i], nullptr);
+    xcb_get_property_reply_t* reply = xcb()->get_property_reply(
+        ctx->connection, property_cookies[i], nullptr);
 
     if (!reply)
       continue;
@@ -1195,7 +1252,7 @@ void sl_handle_map_request(struct sl_context* ctx,
 
     const char* value = nullptr;
     int value_int = std::numeric_limits<int>::max();
-    xcb_atom_t* reply_atoms = nullptr;
+    xcb_atom_t* property_values = nullptr;
 
     switch (properties[i].type) {
       case PROPERTY_WM_NAME:
@@ -1203,8 +1260,8 @@ void sl_handle_map_request(struct sl_context* ctx,
         // present or not yet processed, thus window->name is null.
         if (!window->has_net_wm_name) {
           window->name =
-              strndup(static_cast<char*>(xcb_get_property_value(reply)),
-                      xcb_get_property_value_length(reply));
+              strndup(static_cast<char*>(xcb()->get_property_value(reply)),
+                      xcb()->get_property_value_length(reply));
           value = window->name;
         }
         break;
@@ -1217,8 +1274,8 @@ void sl_handle_map_request(struct sl_context* ctx,
         }
         window->has_net_wm_name = true;
         window->name =
-            strndup(static_cast<char*>(xcb_get_property_value(reply)),
-                    xcb_get_property_value_length(reply));
+            strndup(static_cast<char*>(xcb()->get_property_value(reply)),
+                    xcb()->get_property_value_length(reply));
         value = window->name;
         break;
       case PROPERTY_WM_CLASS:
@@ -1227,59 +1284,62 @@ void sl_handle_map_request(struct sl_context* ctx,
           value = "<invalid>";
         break;
       case PROPERTY_WM_TRANSIENT_FOR:
-        if (xcb_get_property_value_length(reply) >= 4) {
+        if (xcb()->get_property_value_length(reply) >= 4) {
           window->transient_for =
-              *(reinterpret_cast<uint32_t*>(xcb_get_property_value(reply)));
+              *(reinterpret_cast<uint32_t*>(xcb()->get_property_value(reply)));
           value_int = window->transient_for;
         }
         break;
       case PROPERTY_WM_NORMAL_HINTS:
-        if (xcb_get_property_value_length(reply) >=
+        if (xcb()->get_property_value_length(reply) >=
             static_cast<int>(sizeof(size_hints)))
-          memcpy(&size_hints, xcb_get_property_value(reply),
+          memcpy(&size_hints, xcb()->get_property_value(reply),
                  sizeof(size_hints));
         break;
       case PROPERTY_WM_CLIENT_LEADER:
-        if (xcb_get_property_value_length(reply) >= 4) {
+        if (xcb()->get_property_value_length(reply) >= 4) {
           window->client_leader =
-              *(reinterpret_cast<uint32_t*>(xcb_get_property_value(reply)));
+              *(reinterpret_cast<uint32_t*>(xcb()->get_property_value(reply)));
           value_int = window->client_leader;
         }
         break;
       case PROPERTY_WM_PROTOCOLS:
-        reply_atoms = static_cast<xcb_atom_t*>(xcb_get_property_value(reply));
+        property_values =
+            static_cast<xcb_atom_t*>(xcb()->get_property_value(reply));
         for (unsigned j = 0;
-             j < xcb_get_property_value_length(reply) / sizeof(xcb_atom_t);
+             j < xcb()->get_property_value_length(reply) / sizeof(xcb_atom_t);
              ++j) {
-          if (reply_atoms[j] == ctx->atoms[ATOM_WM_TAKE_FOCUS].value) {
+          if (property_values[j] == ctx->atoms[ATOM_WM_TAKE_FOCUS].value) {
             window->focus_model_take_focus = 1;
             value = "ATOM_WM_TAKE_FOCUS";
           }
         }
         break;
       case PROPERTY_MOTIF_WM_HINTS:
-        if (xcb_get_property_value_length(reply) >=
+        if (xcb()->get_property_value_length(reply) >=
             static_cast<int>(sizeof(mwm_hints)))
-          memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
+          memcpy(&mwm_hints, xcb()->get_property_value(reply),
+                 sizeof(mwm_hints));
         break;
       case PROPERTY_NET_STARTUP_ID:
         window->startup_id =
-            strndup(static_cast<char*>(xcb_get_property_value(reply)),
-                    xcb_get_property_value_length(reply));
+            strndup(static_cast<char*>(xcb()->get_property_value(reply)),
+                    xcb()->get_property_value_length(reply));
         value = window->startup_id;
         break;
       case PROPERTY_NET_WM_STATE:
-        reply_atoms = static_cast<xcb_atom_t*>(xcb_get_property_value(reply));
+        property_values =
+            static_cast<xcb_atom_t*>(xcb()->get_property_value(reply));
         for (unsigned j = 0;
-             j < xcb_get_property_value_length(reply) / sizeof(xcb_atom_t);
+             j < xcb()->get_property_value_length(reply) / sizeof(xcb_atom_t);
              ++j) {
-          if (reply_atoms[j] ==
+          if (property_values[j] ==
               ctx->atoms[ATOM_NET_WM_STATE_MAXIMIZED_HORZ].value) {
             maximize_h = true;
-          } else if (reply_atoms[j] ==
+          } else if (property_values[j] ==
                      ctx->atoms[ATOM_NET_WM_STATE_MAXIMIZED_VERT].value) {
             maximize_v = true;
-          } else if (reply_atoms[j] ==
+          } else if (property_values[j] ==
                      ctx->atoms[ATOM_NET_WM_STATE_FULLSCREEN].value) {
             fullscreen = true;
           }
@@ -1289,6 +1349,7 @@ void sl_handle_map_request(struct sl_context* ctx,
         // behaviour is consistent with sl_handle_client_message().
         window->maximized = maximize_h && maximize_v;
         window->fullscreen = fullscreen;
+        LOG(VERBOSE) << window << " fullscreen=" << fullscreen;
         if (window->maximized) {
           if (window->fullscreen) {
             value =
@@ -1302,13 +1363,32 @@ void sl_handle_map_request(struct sl_context* ctx,
         }
         break;
       case PROPERTY_GTK_THEME_VARIANT:
-        if (xcb_get_property_value_length(reply) >= 4)
+        if (xcb()->get_property_value_length(reply) >= 4)
           window->dark_frame = !strcmp(
-              static_cast<char*>(xcb_get_property_value(reply)), "dark");
+              static_cast<char*>(xcb()->get_property_value(reply)), "dark");
+        break;
+      case PROPERTY_STEAM_GAME:
+        on_steam_game_id_updated(ctx, window, reply);
         break;
       case PROPERTY_SPECIFIED_FOR_APP_ID:
         sl_set_application_id_from_atom(ctx, window, reply);
         value = window->app_id_property.c_str();
+        break;
+      case PROPERTY_NET_WM_WINDOW_TYPE:
+        property_values =
+            static_cast<xcb_atom_t*>(xcb()->get_property_value(reply));
+        if (xcb()->get_property_value_length(reply) == sizeof(xcb_atom_t)) {
+          window->type = property_values[0];
+        }
+        break;
+      case PROPERTY_NET_WM_PID:
+        property_values =
+            static_cast<xcb_atom_t*>(xcb()->get_property_value(reply));
+        if (xcb()->get_property_value_length(reply) == sizeof(xcb_atom_t)) {
+          window->pid = property_values[0];
+          // Double check if the window should be containerized
+          sl_window_update_should_be_containerized_from_pid(window);
+        }
         break;
       default:
         break;
@@ -1338,6 +1418,9 @@ void sl_handle_map_request(struct sl_context* ctx,
                       break;
                   }
                 });
+#ifndef PERFETTO_TRACING
+    UNUSED(value_int);
+#endif
 
     free(reply);
   }
@@ -1350,23 +1433,23 @@ void sl_handle_map_request(struct sl_context* ctx,
   }
 
   // Allow user/program controlled position for transients,
-  // or for all windows if --enable_x11_move_windows was specified.
-  if (window->transient_for || ctx->enable_x11_move_windows)
+  // and other client-positioned windows.
+  if (window->transient_for || sl_window_is_client_positioned(window))
     window->size_flags |= size_hints.flags & (US_POSITION | P_POSITION);
 
   // If startup ID is not set, then try the client leader window.
   if (!window->startup_id && window->client_leader) {
-    xcb_get_property_reply_t* reply = xcb_get_property_reply(
+    xcb_get_property_reply_t* reply = xcb()->get_property_reply(
         ctx->connection,
-        xcb_get_property(ctx->connection, 0, window->client_leader,
-                         ctx->atoms[ATOM_NET_STARTUP_ID].value, XCB_ATOM_ANY, 0,
-                         2048),
+        xcb()->get_property(ctx->connection, 0, window->client_leader,
+                            ctx->atoms[ATOM_NET_STARTUP_ID].value, XCB_ATOM_ANY,
+                            0, 2048),
         nullptr);
     if (reply) {
       if (reply->type != XCB_ATOM_NONE) {
         window->startup_id =
-            strndup(static_cast<char*>(xcb_get_property_value(reply)),
-                    xcb_get_property_value_length(reply));
+            strndup(static_cast<char*>(xcb()->get_property_value(reply)),
+                    xcb()->get_property_value_length(reply));
       }
       free(reply);
     }
@@ -1376,10 +1459,22 @@ void sl_handle_map_request(struct sl_context* ctx,
   if (window->size_flags & P_MIN_SIZE) {
     window->min_width = size_hints.min_width;
     window->min_height = size_hints.min_height;
+    LOG(VERBOSE) << window << " min=" << window->min_width << "x"
+                 << window->min_height;
   }
   if (window->size_flags & P_MAX_SIZE) {
-    window->max_width = size_hints.max_width;
-    window->max_height = size_hints.max_height;
+    if (size_hints.max_width < INT_MAX) {
+      window->max_width = size_hints.max_width;
+    } else {
+      window->max_width = 0;
+    }
+    if (size_hints.max_height < INT_MAX) {
+      window->max_height = size_hints.max_height;
+    } else {
+      window->max_height = 0;
+    }
+    LOG(VERBOSE) << window << " max=" << window->max_width << "x"
+                 << window->max_height;
   }
 
   window->border_width = 0;
@@ -1387,13 +1482,12 @@ void sl_handle_map_request(struct sl_context* ctx,
   if (!(window->size_flags & (US_POSITION | P_POSITION)))
     sl_adjust_window_position_for_screen_size(window);
 
-  values[0] = window->width;
-  values[1] = window->height;
+  sl_window_get_width_height(window, &values[0], &values[1]);
   values[2] = 0;
-  xcb_configure_window(ctx->connection, window->id,
-                       XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
-                           XCB_CONFIG_WINDOW_BORDER_WIDTH,
-                       values);
+  xcb()->configure_window(ctx->connection, window->id,
+                          XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT |
+                              XCB_CONFIG_WINDOW_BORDER_WIDTH,
+                          values);
   // This needs to match the frame extents of the X11 frame window used
   // for reparenting or applications tend to be confused. The actual window
   // frame size used by the host compositor can be different.
@@ -1401,14 +1495,14 @@ void sl_handle_map_request(struct sl_context* ctx,
   values[1] = 0;
   values[2] = 0;
   values[3] = 0;
-  xcb_change_property(ctx->connection, XCB_PROP_MODE_REPLACE, window->id,
-                      ctx->atoms[ATOM_NET_FRAME_EXTENTS].value,
-                      XCB_ATOM_CARDINAL, 32, 4, values);
+  xcb()->change_property(ctx->connection, XCB_PROP_MODE_REPLACE, window->id,
+                         ctx->atoms[ATOM_NET_FRAME_EXTENTS].value,
+                         XCB_ATOM_CARDINAL, 32, 4, values);
 
   // Remove weird gravities.
   values[0] = XCB_GRAVITY_NORTH_WEST;
-  xcb_change_window_attributes(ctx->connection, window->id, XCB_CW_WIN_GRAVITY,
-                               values);
+  xcb()->change_window_attributes(ctx->connection, window->id,
+                                  XCB_CW_WIN_GRAVITY, values);
 
   if (window->frame_id == XCB_WINDOW_NONE) {
     int depth = window->depth ? window->depth : ctx->screen->root_depth;
@@ -1418,23 +1512,22 @@ void sl_handle_map_request(struct sl_context* ctx,
                 XCB_EVENT_MASK_SUBSTRUCTURE_REDIRECT;
     values[2] = ctx->colormaps[depth];
 
-    window->frame_id = xcb_generate_id(ctx->connection);
-    xcb_create_window(
+    window->frame_id = xcb()->generate_id(ctx->connection);
+    xcb()->create_window(
         ctx->connection, depth, window->frame_id, ctx->screen->root, window->x,
         window->y, window->width, window->height, 0,
         XCB_WINDOW_CLASS_INPUT_OUTPUT, ctx->visual_ids[depth],
         XCB_CW_BORDER_PIXEL | XCB_CW_EVENT_MASK | XCB_CW_COLORMAP, values);
     values[0] = XCB_STACK_MODE_BELOW;
-    xcb_configure_window(ctx->connection, window->frame_id,
-                         XCB_CONFIG_WINDOW_STACK_MODE, values);
-    xcb_reparent_window(ctx->connection, window->id, window->frame_id, 0, 0);
+    xcb()->configure_window(ctx->connection, window->frame_id,
+                            XCB_CONFIG_WINDOW_STACK_MODE, values);
+    xcb()->reparent_window(ctx->connection, window->id, window->frame_id, 0, 0);
   } else {
-    values[0] = window->x;
-    values[1] = window->y;
-    values[2] = window->width;
-    values[3] = window->height;
+    // Populate values[0~3] with x,y,w,h
+    sl_window_get_x_y(window, &values[0], &values[1]);
+    sl_window_get_width_height(window, &values[2], &values[3]);
     values[4] = XCB_STACK_MODE_BELOW;
-    xcb_configure_window(
+    xcb()->configure_window(
         ctx->connection, window->frame_id,
         XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y | XCB_CONFIG_WINDOW_WIDTH |
             XCB_CONFIG_WINDOW_HEIGHT | XCB_CONFIG_WINDOW_STACK_MODE,
@@ -1444,8 +1537,8 @@ void sl_handle_map_request(struct sl_context* ctx,
   sl_window_set_wm_state(window, WM_STATE_NORMAL);
   sl_send_configure_notify(window);
 
-  xcb_map_window(ctx->connection, window->id);
-  xcb_map_window(ctx->connection, window->frame_id);
+  xcb()->map_window(ctx->connection, window->id);
+  xcb()->map_window(ctx->connection, window->frame_id);
 }
 
 static void sl_handle_map_notify(struct sl_context* ctx,
@@ -1564,10 +1657,9 @@ void sl_handle_configure_request(struct sl_context* ctx,
   else
     sl_adjust_window_position_for_screen_size(window);
 
-  values[0] = window->x;
-  values[1] = window->y;
-  values[2] = window->width;
-  values[3] = window->height;
+  // Populate values[0~3] with x,y,w,h
+  sl_window_get_x_y(window, &values[0], &values[1]);
+  sl_window_get_width_height(window, &values[2], &values[3]);
   values[4] = 0;
   xcb_configure_window(ctx->connection, window->frame_id,
                        XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
@@ -1770,18 +1862,34 @@ void sl_handle_client_message(struct sl_context* ctx,
                     "action", net_wm_state_to_string(action), "window->name",
                     window->name);
         if (action == NET_WM_STATE_ADD) {
-          window->fullscreen = 1;
-          if (window->xdg_toplevel && !window->iconified) {
-            xdg_toplevel_set_fullscreen(window->xdg_toplevel, nullptr);
-          } else {
-            window->pending_fullscreen_change = true;
+          // Ignore additional calls to change to fullscreen
+          // if X11 state is already fullscreen. Prevents issues when changing
+          // focus back to game and Exo/X11 state differ.
+          if (!window->fullscreen) {
+            window->fullscreen = 1;
+            LOG(VERBOSE) << window << " fullscreen=1";
+            if (window->xdg_toplevel && !window->iconified) {
+              xdg_toplevel_set_fullscreen(window->xdg_toplevel, nullptr);
+            } else {
+              window->pending_fullscreen_change = true;
+            }
           }
         } else if (action == NET_WM_STATE_REMOVE) {
-          window->fullscreen = 0;
-          if (window->xdg_toplevel && !window->iconified) {
-            xdg_toplevel_unset_fullscreen(window->xdg_toplevel);
-          } else {
-            window->pending_fullscreen_change = true;
+          // Ignore additional calls to change to windowed
+          // if X11 state is already windowed. Prevents issues when changing
+          // focus back to game and Exo/X11 state differ.
+          if (window->fullscreen) {
+            // Preemptively ask Exo to remove fullscreen then check during
+            // surface commit (ie. after all states aggregated).
+            window->maybe_promote_to_fullscreen = true;
+
+            window->fullscreen = 0;
+            LOG(VERBOSE) << window << " fullscreen=0";
+            if (window->xdg_toplevel && !window->iconified) {
+              xdg_toplevel_unset_fullscreen(window->xdg_toplevel);
+            } else {
+              window->pending_fullscreen_change = true;
+            }
           }
         }
       }
@@ -1817,48 +1925,37 @@ void sl_handle_client_message(struct sl_context* ctx,
                 "window->name", window ? window->name : "<unknown>");
     if (window && window->xdg_toplevel) {
       xdg_toplevel_set_minimized(window->xdg_toplevel);
-#ifdef BLACK_SCREEN_FIX
-      // Workaround for some borealis apps showing a black screen after losing
-      // focus from fullscreen.
-      // When a window is iconified, it should be unmapped. To return it back
-      // to a visible state, it should be remapped. However sommelier does not
-      // do this. Therefore we are sending a synthetic unmap then map notify
-      // so that the app is rendered again.
-      xcb_unmap_notify_event_t unmap_event = {.response_type = XCB_UNMAP_NOTIFY,
-                                              .pad0 = 0,
-                                              .event = window->id,
-                                              .window = window->id,
-                                              .from_configure = 0};
+#ifdef QUIRKS_SUPPORT
+      // TODO(b/333819234): Migrate FEATURE_BLACK_SCREEN_FIX to quirk condition
+      // `runtime: Proton`.
+      if (window->ctx->quirks.IsEnabled(window,
+                                        quirks::FEATURE_BLACK_SCREEN_FIX)) {
+        // Workaround for some borealis apps showing a black screen after losing
+        // focus from fullscreen.
+        // When a window is iconified, it should be unmapped. To return it back
+        // to a visible state, it should be remapped. However sommelier does not
+        // do this. Therefore we are sending a synthetic unmap then map notify
+        // so that the app is rendered again.
+        xcb_unmap_notify_event_t unmap_event = {
+            .response_type = XCB_UNMAP_NOTIFY,
+            .pad0 = 0,
+            .event = window->id,
+            .window = window->id,
+            .from_configure = 0};
 
-      xcb_send_event(ctx->connection, 0, window->id,
-                     XCB_EVENT_MASK_STRUCTURE_NOTIFY,
-                     reinterpret_cast<char*>(&unmap_event));
-      sl_send_configure_notify(window);
+        xcb_send_event(ctx->connection, 0, window->id,
+                       XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+                       reinterpret_cast<char*>(&unmap_event));
+        sl_send_configure_notify(window);
 
-      sl_window_set_wm_state(window, WM_STATE_ICONIC);
-      sl_send_configure_notify(window);
+        sl_window_set_wm_state(window, WM_STATE_ICONIC);
+        sl_send_configure_notify(window);
 
-      xcb_map_notify_event_t map_event = {.response_type = XCB_MAP_NOTIFY,
-                                          .pad0 = 0,
-                                          .event = window->id,
-                                          .window = window->id,
-                                          .override_redirect = 0};
-
-      xcb_send_event(ctx->connection, 0, window->id,
-                     XCB_EVENT_MASK_STRUCTURE_NOTIFY,
-                     reinterpret_cast<char*>(&map_event));
-      sl_send_configure_notify(window);
-
-      sl_window_set_wm_state(window, WM_STATE_NORMAL);
-      sl_send_configure_notify(window);
-
-      sl_set_input_focus(ctx, nullptr);
-      xcb_flush(ctx->connection);
-
-      // When we are iconified we want to suppress any calls that deiconify
-      // the window as it should in theory be unmapped.
-      window->iconified = 1;
-#endif
+        // When we are iconified we want to suppress any calls that deiconify
+        // the window as it should in theory be unmapped.
+        window->iconified = 1;
+      }
+#endif  // QUIRKS_SUPPORT
     }
   }
 }
@@ -1890,7 +1987,26 @@ void sl_handle_focus_in(struct sl_context* ctx, xcb_focus_in_event_t* event) {
       }
       window->pending_maximized_change = false;
     }
-    window->iconified = 0;
+    if (window->iconified) {
+      // Remap the window that was iconified upon gaining focus.
+      xcb_map_notify_event_t map_event = {.response_type = XCB_MAP_NOTIFY,
+                                          .pad0 = 0,
+                                          .event = window->id,
+                                          .window = window->id,
+                                          .override_redirect = 0};
+
+      xcb_send_event(window->ctx->connection, 0, window->id,
+                     XCB_EVENT_MASK_STRUCTURE_NOTIFY,
+                     reinterpret_cast<char*>(&map_event));
+      sl_send_configure_notify(window);
+
+      sl_window_set_wm_state(window, WM_STATE_NORMAL);
+      sl_send_configure_notify(window);
+
+      xcb_flush(window->ctx->connection);
+
+      window->iconified = 0;
+    }
   }
 }
 
@@ -1950,7 +2066,7 @@ static int sl_handle_selection_fd_writable(int fd, uint32_t mask, void* data) {
 
   bytes = write(fd, value + ctx->selection_property_offset, bytes_left);
   if (bytes == -1) {
-    fprintf(stderr, "write error to target fd: %m\n");
+    LOG(ERROR) << "write error to target fd: " << strerror(errno);
     close(fd);
     fd = -1;
   } else if (bytes == bytes_left) {
@@ -2051,7 +2167,7 @@ static int sl_handle_selection_fd_readable(int fd, uint32_t mask, void* data) {
 
   int bytes = read(fd, p, bytes_left);
   if (bytes == -1) {
-    fprintf(stderr, "read error from data source: %m\n");
+    LOG(ERROR) << "read error from data source: " << strerror(errno);
     sl_send_selection_notify(ctx, XCB_ATOM_NONE);
     ctx->selection_data_offer_receive_fd = -1;
     close(fd);
@@ -2124,15 +2240,15 @@ void sl_handle_property_notify(struct sl_context* ctx,
       atom = XCB_ATOM_WM_NAME;
 
     if (atom != XCB_ATOM_NONE) {
-      xcb_get_property_reply_t* reply = xcb_get_property_reply(
+      xcb_get_property_reply_t* reply = xcb()->get_property_reply(
           ctx->connection,
-          xcb_get_property(ctx->connection, 0, window->id, atom, XCB_ATOM_ANY,
-                           0, 2048),
+          xcb()->get_property(ctx->connection, 0, window->id, atom,
+                              XCB_ATOM_ANY, 0, 2048),
           nullptr);
       if (reply) {
         window->name =
-            strndup(static_cast<char*>(xcb_get_property_value(reply)),
-                    xcb_get_property_value_length(reply));
+            strndup(static_cast<char*>(xcb()->get_property_value(reply)),
+                    xcb()->get_property_value_length(reply));
         free(reply);
 
         if (atom == ctx->atoms[ATOM_NET_WM_NAME].value) {
@@ -2155,15 +2271,24 @@ void sl_handle_property_notify(struct sl_context* ctx,
       return;
 
     xcb_get_property_cookie_t cookie =
-        xcb_get_property(ctx->connection, 0, window->id, XCB_ATOM_WM_CLASS,
-                         XCB_ATOM_ANY, 0, 2048);
+        xcb()->get_property(ctx->connection, 0, window->id, XCB_ATOM_WM_CLASS,
+                            XCB_ATOM_ANY, 0, 2048);
     xcb_get_property_reply_t* reply =
-        xcb_get_property_reply(ctx->connection, cookie, nullptr);
+        xcb()->get_property_reply(ctx->connection, cookie, nullptr);
     if (reply) {
       sl_decode_wm_class(window, reply);
       free(reply);
     }
     sl_update_application_id(ctx, window);
+  } else if (event->atom == ctx->atoms[ATOM_STEAM_GAME].value) {
+    struct sl_window* window = sl_lookup_window(ctx, event->window);
+    if (window) {
+      xcb_get_property_cookie_t cookie = xcb()->get_property(
+          ctx->connection, 0, window->id, event->atom, XCB_ATOM_CARDINAL, 0, 1);
+      xcb_get_property_reply_t* reply =
+          xcb()->get_property_reply(ctx->connection, cookie, nullptr);
+      on_steam_game_id_updated(ctx, window, reply);
+    }
   } else if (event->atom == ctx->application_id_property_atom) {
     struct sl_window* window = sl_lookup_window(ctx, event->window);
     if (!window || event->state == XCB_PROPERTY_DELETE)
@@ -2172,11 +2297,11 @@ void sl_handle_property_notify(struct sl_context* ctx,
     // TODO(cpelling): Support other atom types (e.g. strings) if/when a use
     // case arises. The current use case is for cardinals (uint32) but this
     // is easy enough to extend later.
-    xcb_get_property_cookie_t cookie = xcb_get_property(
+    xcb_get_property_cookie_t cookie = xcb()->get_property(
         ctx->connection, 0, window->id, ctx->application_id_property_atom,
         XCB_ATOM_CARDINAL, 0, 1);
     xcb_get_property_reply_t* reply =
-        xcb_get_property_reply(ctx->connection, cookie, nullptr);
+        xcb()->get_property_reply(ctx->connection, cookie, nullptr);
     if (reply) {
       sl_set_application_id_from_atom(ctx, window, reply);
       sl_update_application_id(ctx, window);
@@ -2187,18 +2312,20 @@ void sl_handle_property_notify(struct sl_context* ctx,
     if (!window)
       return;
 
+    // Don't report min/max size by default.
     window->size_flags &= ~(P_MIN_SIZE | P_MAX_SIZE);
 
     if (event->state != XCB_PROPERTY_DELETE) {
       struct sl_wm_size_hints size_hints = {0};
-      xcb_get_property_reply_t* reply = xcb_get_property_reply(
+      xcb_get_property_reply_t* reply = xcb()->get_property_reply(
           ctx->connection,
-          xcb_get_property(ctx->connection, 0, window->id,
-                           XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_ANY, 0,
-                           sizeof(size_hints)),
+          xcb()->get_property(ctx->connection, 0, window->id,
+                              XCB_ATOM_WM_NORMAL_HINTS, XCB_ATOM_ANY, 0,
+                              sizeof(size_hints)),
           nullptr);
       if (reply) {
-        memcpy(&size_hints, xcb_get_property_value(reply), sizeof(size_hints));
+        memcpy(&size_hints, xcb()->get_property_value(reply),
+               sizeof(size_hints));
         free(reply);
       }
       TRACE_EVENT("x11wm", "XCB_PROPERTY_NOTIFY: XCB_ATOM_WM_NORMAL_HINTS",
@@ -2210,10 +2337,22 @@ void sl_handle_property_notify(struct sl_context* ctx,
       if (window->size_flags & P_MIN_SIZE) {
         window->min_width = size_hints.min_width;
         window->min_height = size_hints.min_height;
+        LOG(VERBOSE) << window << " min=" << window->min_width << "x"
+                     << window->min_height;
       }
       if (window->size_flags & P_MAX_SIZE) {
-        window->max_width = size_hints.max_width;
-        window->max_height = size_hints.max_height;
+        if (size_hints.max_width < INT_MAX) {
+          window->max_width = size_hints.max_width;
+        } else {
+          window->max_width = 0;
+        }
+        if (size_hints.max_height < INT_MAX) {
+          window->max_height = size_hints.max_height;
+        } else {
+          window->max_height = 0;
+        }
+        LOG(VERBOSE) << window << " max=" << window->max_width << "x"
+                     << window->max_height;
       }
     }
 
@@ -2249,15 +2388,15 @@ void sl_handle_property_notify(struct sl_context* ctx,
     if (event->state == XCB_PROPERTY_DELETE)
       return;
     struct sl_wm_hints wm_hints = {0};
-    xcb_get_property_reply_t* reply = xcb_get_property_reply(
+    xcb_get_property_reply_t* reply = xcb()->get_property_reply(
         ctx->connection,
-        xcb_get_property(ctx->connection, 0, window->id, XCB_ATOM_WM_HINTS,
-                         XCB_ATOM_ANY, 0, sizeof(wm_hints)),
+        xcb()->get_property(ctx->connection, 0, window->id, XCB_ATOM_WM_HINTS,
+                            XCB_ATOM_ANY, 0, sizeof(wm_hints)),
         nullptr);
 
     if (!reply)
       return;
-    memcpy(&wm_hints, xcb_get_property_value(reply), sizeof(wm_hints));
+    memcpy(&wm_hints, xcb()->get_property_value(reply), sizeof(wm_hints));
     free(reply);
 
     if (wm_hints.flags & WM_HINTS_FLAG_URGENCY) {
@@ -2273,16 +2412,17 @@ void sl_handle_property_notify(struct sl_context* ctx,
 
     if (event->state != XCB_PROPERTY_DELETE) {
       struct sl_mwm_hints mwm_hints = {0};
-      xcb_get_property_reply_t* reply = xcb_get_property_reply(
+      xcb_get_property_reply_t* reply = xcb()->get_property_reply(
           ctx->connection,
-          xcb_get_property(ctx->connection, 0, window->id,
-                           ctx->atoms[ATOM_MOTIF_WM_HINTS].value, XCB_ATOM_ANY,
-                           0, sizeof(mwm_hints)),
+          xcb()->get_property(ctx->connection, 0, window->id,
+                              ctx->atoms[ATOM_MOTIF_WM_HINTS].value,
+                              XCB_ATOM_ANY, 0, sizeof(mwm_hints)),
           nullptr);
       if (reply) {
-        if (xcb_get_property_value_length(reply) >=
+        if (xcb()->get_property_value_length(reply) >=
             static_cast<int>(sizeof(mwm_hints))) {
-          memcpy(&mwm_hints, xcb_get_property_value(reply), sizeof(mwm_hints));
+          memcpy(&mwm_hints, xcb()->get_property_value(reply),
+                 sizeof(mwm_hints));
         }
         free(reply);
         if (mwm_hints.flags & MWM_HINTS_DECORATIONS) {
@@ -2313,16 +2453,16 @@ void sl_handle_property_notify(struct sl_context* ctx,
     window->dark_frame = 0;
 
     if (event->state != XCB_PROPERTY_DELETE) {
-      xcb_get_property_reply_t* reply = xcb_get_property_reply(
+      xcb_get_property_reply_t* reply = xcb()->get_property_reply(
           ctx->connection,
-          xcb_get_property(ctx->connection, 0, window->id,
-                           ctx->atoms[ATOM_GTK_THEME_VARIANT].value,
-                           XCB_ATOM_ANY, 0, 2048),
+          xcb()->get_property(ctx->connection, 0, window->id,
+                              ctx->atoms[ATOM_GTK_THEME_VARIANT].value,
+                              XCB_ATOM_ANY, 0, 2048),
           nullptr);
       if (reply) {
-        if (xcb_get_property_value_length(reply) >= 4)
+        if (xcb()->get_property_value_length(reply) >= 4)
           window->dark_frame = !strcmp(
-              static_cast<char*>(xcb_get_property_value(reply)), "dark");
+              static_cast<char*>(xcb()->get_property_value(reply)), "dark");
         free(reply);
       }
     }
@@ -2335,36 +2475,123 @@ void sl_handle_property_notify(struct sl_context* ctx,
                                    frame_color);
   } else if (event->atom ==
              ctx->atoms[ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS].value) {
+    struct sl_window* window = sl_lookup_window(ctx, event->window);
+
+    if (!window) {
+      TRACE_EVENT("x11wm",
+                  "XCB_PROPERTY_NOTIFY: _XWAYLAND_RANDR_EMU_MONITOR_RECTS",
+                  [&](perfetto::EventContext p) {
+                    perfetto_annotate_window(ctx, p, "window", event->window);
+                  });
+      return;
+    }
+
+    xcb_get_property_reply_t* reply = xcb()->get_property_reply(
+        ctx->connection,
+        xcb()->get_property(
+            ctx->connection, 0, window->id,
+            ctx->atoms[ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS].value,
+            XCB_ATOM_CARDINAL, 0, 2048),
+        nullptr);
+
+    xcb_get_property_reply_t* reply_for_trace =
+        static_cast<xcb_get_property_reply_t*>(
+            malloc(sizeof(xcb_get_property_reply_t)));
+    memcpy(reply_for_trace, reply, sizeof(*reply));
     TRACE_EVENT("x11wm",
                 "XCB_PROPERTY_NOTIFY: _XWAYLAND_RANDR_EMU_MONITOR_RECTS",
                 [&](perfetto::EventContext p) {
-                  xcb_get_property_cookie_t cookie = xcb_get_property(
-                      ctx->connection, 0, event->window,
-                      ctx->atoms[ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS].value,
-                      XCB_ATOM_ANY, 0, 2048);
-
                   perfetto_annotate_window(ctx, p, "window", event->window);
-
-                  xcb_get_property_reply_t* reply =
-                      xcb_get_property_reply(ctx->connection, cookie, nullptr);
-                  perfetto_annotate_cardinal_list(p, "value", reply);
-                  free(reply);
+                  perfetto_annotate_cardinal_list(p, "value", reply_for_trace);
+                  free(reply_for_trace);
                 });
+
+    if (!ctx->allow_xwayland_emulate_screen_pos_size) {
+      return;
+    }
+
+    if (!reply || reply->value_len == 0 || reply->value_len % 4 != 0) {
+      // Stop using emulated rects when:
+      // - the window property is unset (ie. len == 0), we are back to native
+      // - the window property length is not a multiple of 4 (property invalid)
+      //   resolution
+      // - we failed to get reply
+      LOG(VERBOSE) << window << " _RANDR_EMU_MONITOR_RECTS unset";
+      window->use_emulated_rects = false;
+      free(reply);
+      return;
+    }
+
+    uint32_t* xywh = static_cast<uint32_t*>(xcb()->get_property_value(reply));
+    if (!xywh) {
+      // The values are probably incorrectly set by XWayland, consider it as
+      // buggy and do not proceed further.
+      LOG(VERBOSE) << window << " _RANDR_EMU_MONITOR_RECTS invalid values";
+      window->use_emulated_rects = false;
+      free(reply);
+      return;
+    }
+
+    // We need to select the appropriate emulated screen based on the screen the
+    // window is in.
+    uint32_t target_x = 0;
+    uint32_t target_y = 0;
+    if (!sl_window_get_output_virt_position(window, target_x, target_y)) {
+      LOG(ERROR) << window
+                 << " _RANDR_EMU_MONITOR_RECTS failed to find output it is in";
+      window->use_emulated_rects = false;
+      free(reply);
+      return;
+    }
+
+    for (uint32_t i = 0; i < reply->value_len; i += 4) {
+      // Assume the fullscreen window position is the screen's position.
+      // XWayland emulation must match this x/y coordinates.
+      if (xywh[i] == target_x && xywh[i + 1] == target_y) {
+        window->emulated_x = xywh[i];
+        window->emulated_y = xywh[i + 1];
+        window->emulated_width = xywh[i + 2];
+        window->emulated_height = xywh[i + 3];
+        window->use_emulated_rects = true;
+        // XWayland will send a wp_viewport.set_source and destination request
+        // (plus, do other busy work such as setting pointer scaling) based on
+        // window property set. Configure window manually here to trigger
+        // necessary changes since some games do not do anything further than
+        // adding the attributes.
+        xcb()->configure_window(window->ctx->connection, window->id,
+                                XCB_CONFIG_WINDOW_X | XCB_CONFIG_WINDOW_Y |
+                                    XCB_CONFIG_WINDOW_WIDTH |
+                                    XCB_CONFIG_WINDOW_HEIGHT,
+                                &xywh[i]);
+        LOG(VERBOSE) << window << " _RANDR_EMU_MONITOR_RECTS set as "
+                     << xywh[i + 2] << "x" << xywh[i + 3] << " (" << xywh[i]
+                     << "," << xywh[i + 1] << ")";
+        free(reply);
+        return;
+      }
+    }
+
+    LOG(ERROR)
+        << "_RANDR_EMU_MONITOR_RECTS failed to find screen with position "
+        << target_x << ", " << target_y;
+    window->use_emulated_rects = false;
+    free(reply);
+
   } else if (event->atom == ctx->atoms[ATOM_WL_SELECTION].value) {
     if (event->window == ctx->selection_window &&
         event->state == XCB_PROPERTY_NEW_VALUE &&
         ctx->selection_incremental_transfer) {
-      xcb_get_property_reply_t* reply = xcb_get_property_reply(
+      xcb_get_property_reply_t* reply = xcb()->get_property_reply(
           ctx->connection,
-          xcb_get_property(ctx->connection, 0, ctx->selection_window,
-                           ctx->atoms[ATOM_WL_SELECTION].value,
-                           XCB_GET_PROPERTY_TYPE_ANY, 0, 0x1fffffff),
+          xcb()->get_property(ctx->connection, 0, ctx->selection_window,
+                              ctx->atoms[ATOM_WL_SELECTION].value,
+                              XCB_GET_PROPERTY_TYPE_ANY, 0, 0x1fffffff),
           nullptr);
 
       if (!reply)
         return;
 
-      if (xcb_get_property_value_length(reply) > 0) {
+      if (xcb()->get_property_value_length(reply) > 0) {
         sl_write_selection_property(ctx, reply);
       } else {
         assert(!ctx->selection_send_event_source);
@@ -2594,7 +2821,7 @@ static void sl_send_data(struct sl_context* ctx, xcb_atom_t data_type) {
   }
 
   if (ctx->selection_event_source) {
-    fprintf(stderr, "error: selection transfer already pending\n");
+    LOG(ERROR) << "error: selection transfer already pending";
     sl_send_selection_notify(ctx, XCB_ATOM_NONE);
     return;
   }
@@ -2622,8 +2849,7 @@ static void sl_send_data(struct sl_context* ctx, xcb_atom_t data_type) {
     int pipe_fd;
     rv = ctx->channel->create_pipe(pipe_fd);
     if (rv) {
-      fprintf(stderr, "error: failed to create virtwl pipe: %s\n",
-              strerror(-rv));
+      LOG(ERROR) << "error: failed to create virtwl pipe: " << strerror(-rv);
       sl_send_selection_notify(ctx, XCB_ATOM_NONE);
       return;
     }
@@ -2731,8 +2957,8 @@ static int sl_handle_x_connection_event(int fd, uint32_t mask, void* data) {
   uint32_t count = 0;
 
   if ((mask & WL_EVENT_HANGUP) || (mask & WL_EVENT_ERROR)) {
-    fprintf(stderr, "Got error or hangup (mask %d) on X connection, exiting\n",
-            mask);
+    LOG(FATAL) << "got error or hangup (mask " << mask
+               << ") on X connection, exiting";
     exit(EXIT_SUCCESS);
   }
 
@@ -2852,7 +3078,7 @@ static void sl_set_supported(struct sl_context* ctx) {
 // cursor. If we do not do this, the cursor will be invisible, see b/204724669
 // for details.
 static void sl_initialize_cursor(struct sl_context* ctx) {
-  xcb_generic_error_t* err;
+  [[maybe_unused]] xcb_generic_error_t* err;
   xcb_void_cookie_t cookie;
 
   // Load the "cursor" font, which is a built-in set of fonts, documented at
@@ -3117,7 +3343,7 @@ static int sl_handle_sigchld(int signal_number, void* data) {
     if (pid == ctx->child_pid) {
       ctx->child_pid = -1;
       if (WIFEXITED(status) && WEXITSTATUS(status)) {
-        fprintf(stderr, "Child exited with status: %d\n", WEXITSTATUS(status));
+        LOG(ERROR) << "child exited with status: " << WEXITSTATUS(status);
       }
       if (ctx->exit_with_child) {
         if (ctx->xwayland_pid >= 0)
@@ -3131,8 +3357,7 @@ static int sl_handle_sigchld(int signal_number, void* data) {
     } else if (pid == ctx->xwayland_pid) {
       ctx->xwayland_pid = -1;
       if (WIFEXITED(status) && WEXITSTATUS(status)) {
-        fprintf(stderr, "Xwayland exited with status: %d\n",
-                WEXITSTATUS(status));
+        LOG(FATAL) << "Xwayland exited with status: " << WEXITSTATUS(status);
         exit(WEXITSTATUS(status));
       }
     }
@@ -3143,11 +3368,21 @@ static int sl_handle_sigchld(int signal_number, void* data) {
 
 static int sl_handle_sigusr1(int signal_number, void* data) {
   struct sl_context* ctx = (struct sl_context*)data;
-  fprintf(stderr, "dumping trace %s\n", ctx->trace_filename);
+  LOG(INFO) << "dumping trace " << ctx->trace_filename;
   dump_trace(ctx->trace_filename);
   if (ctx->timing != nullptr) {
     ctx->timing->OutputLog();
   }
+  return 1;
+}
+
+static int sl_handle_stats_timer(void* data) {
+  struct sl_context* ctx = (struct sl_context*)data;
+  if (ctx->frame_stats != nullptr) {
+    ctx->frame_stats->OutputStats();
+  }
+  wl_event_source_timer_update(ctx->stats_timer_event_source.get(),
+                               ctx->stats_timer_delay);
   return 1;
 }
 
@@ -3201,6 +3436,9 @@ static void sl_calculate_scale_for_xwayland(struct sl_context* ctx) {
 
   // Scale affects output state. Send updated output state to xwayland.
   for (auto output : ctx->host_outputs)
+    sl_output_calculate_virtual_dimensions(output);
+  sl_output_update_output_x(ctx);
+  for (auto output : ctx->host_outputs)
     sl_output_send_host_output_state(output);
 }
 
@@ -3222,11 +3460,9 @@ static int sl_handle_display_ready_event(int fd, uint32_t mask, void* data) {
   pid_t pid;
 
   if (!(mask & WL_EVENT_READABLE)) {
-    fprintf(stderr,
-            "Got error or hangup on display ready connection"
-            " (mask %d), exiting\n",
-            mask);
-    exit(EXIT_SUCCESS);
+    LOG(FATAL) << "Got error or hangup on display ready connection (mask"
+               << mask << "), exiting";
+    exit(EXIT_FAILURE);
   }
 
   display_name[0] = ':';
@@ -3273,7 +3509,7 @@ static int sl_handle_display_ready_event(int fd, uint32_t mask, void* data) {
     wl_display_add_client_created_listener(ctx->host_display,
                                            &ctx->extra_client_created_listener);
   } else {
-    fprintf(stderr, "warning: unable to open wayland socket for cros_im.\n");
+    LOG(WARNING) << "unable to open wayland socket for cros_im";
   }
   free(socket_name);
 
@@ -3352,6 +3588,8 @@ static void sl_print_usage() {
       "options:\n"
       "  -h, --help\t\t\tPrint this help\n"
       "  -X\t\t\t\tEnable X11 forwarding\n"
+      "  --log-level=LEVEL\t\tSet minimum log level to be processed\n"
+      "\t(allowed range: -1 to 3; lower is more verbose))\n"
       "  --parent\t\t\tRun as parent and spawn child processes\n"
       "  --socket=SOCKET\t\tName of socket to listen on\n"
       "  --display=DISPLAY\t\tWayland display to connect to\n"
@@ -3373,6 +3611,8 @@ static void sl_print_usage() {
       "  --xwayland-path=PATH\t\tPath to Xwayland executable\n"
       "  --xwayland-gl-driver-path=PATH\tPath to GL drivers for Xwayland\n"
       "  --xwayland-cmd-prefix=PREFIX\tXwayland command line prefix\n"
+      "  --enable-linux-dmabuf\t\tEnable client-facing zwp_linux_dmabuf_v1 "
+      "extension support\n"
       "  --enable-xshape\t\tEnable X11 XShape extension support\n"
       "  --enable-x11-move-windows\t\tLet X11 apps control window position,\n"
       "\tif the host compositor supports the aura_shell protocol.\n"
@@ -3385,23 +3625,72 @@ static void sl_print_usage() {
       "  --glamor\t\t\tUse glamor to accelerate X11 clients\n"
       "  --timing-filename=PATH\tPath to timing output log\n"
       "  --direct-scale\t\tEnable direct scaling mode\n"
+      "  --viewport-resize\t\tUse viewport to resize unresizable windows.\n"
 #ifdef PERFETTO_TRACING
       "  --trace-filename=PATH\t\tPath to Perfetto trace filename\n"
       "  --trace-system\t\tPerfetto trace to system daemon\n"
 #endif
+#ifdef QUIRKS_SUPPORT
+      "  --quirks-config=PATH[,PATH...]\tOne or more 'quirks' config files.\n"
+      "  --print-enabled-features=STEAM_GAME_ID\tPrint features enabled via "
+      "quirks for the game specified, then exit.\n"
+#endif
+      "  --stats-summary=PATH\t\tPath for recent frame timing stats "
+      "(rewrites)\n"
+      "  --stats-log=PATH\t\t\tPath to log/append frame timing stats "
+      "(appends)\n"
+      "\tThe two previous arguments log the same data for different usages.\n"
+      "\tThe summary is the most recent entries for the metrics collector,\n"
+      "\twhile the log will grow infinitely and is intended for debugging\n"
+      "\tor development purposes.\n"
+      "  --stats-timer=SECS\t\tNumber of seconds between stats dumps\n"
       "  --fullscreen-mode=MODE\tDefault fullscreen behavior (immersive,"
       " plain)\n"
-      "  --noop-driver\t\tPass through to existing Wayland server"
+      "  --virtgpu-channel\t\tUse virtgpu cross-domain context as virtual"
+      " wayland channel\n"
+      "  --noop-driver\t\t\tPass through to existing Wayland server"
       " without virtualization\n");
 }
 
 static const char* sl_arg_value(const char* arg) {
+  assert(arg != nullptr);
+
   const char* s = strchr(arg, '=');
   if (!s) {
     sl_print_usage();
+    printf("\n");
+    LOG(FATAL) << "failed to extract value from arg '" << arg
+               << "'. expected form is " << arg << "=value";
     exit(EXIT_FAILURE);
   }
   return s + 1;
+}
+
+// attempts to both split "--argname=argval" and parse "argval" signed integer,
+// or exits the program with a fatal error if detecting any non-integer
+// characters or is out-of-bounds.
+static int64_t sl_arg_parse_int_checked(const char* arg) {
+  assert(arg != nullptr);
+  const char* argval = sl_arg_value(arg);
+
+  // Use strtoll() because atoi() fails with UB, not error signaling.
+  // Note, that both parse and out-of-range failures are detected here,
+  // unlike atoi() (which implicitly succeeds with return value 0);
+  //
+  // e.g. atoi() parses "blah8" as '0' and "8blah" as '8', while this procedure
+  // detects invalid input in both cases and signals a fatality.
+  char* str_end;
+  int64_t res = strtoll(argval, &str_end, 10);
+
+  const bool has_non_numerical = (str_end == argval || *str_end != '\0');
+  const bool out_of_bounds =
+      (res == LLONG_MAX || res == LLONG_MIN) && errno == ERANGE;
+  if (has_non_numerical || out_of_bounds) {
+    LOG(FATAL) << "failed to convert string '" << argval
+               << "' to int while parsing argument '" << arg << "'";
+    exit(EXIT_FAILURE);
+  }
+  return res;
 }
 
 // Parse the list of accelerators that should be reserved by the
@@ -3410,8 +3699,9 @@ static const char* sl_arg_value(const char* arg) {
 // XKB key symbol name (E.g Delete).
 // Sommelier will exit with EXIT_FAILURE if this returns false.
 // TODO(b/237946069) Confirm accelerator handling works with i18n.
-static bool sl_parse_accelerators(struct wl_list* accelerator_list,
-                                  const char* accelerators) {
+static bool sl_parse_accelerators(
+    std::vector<struct sl_accelerator*>& accelerator_list,
+    const char* accelerators) {
   if (accelerators) {
     uint32_t modifiers = 0;
 
@@ -3429,7 +3719,7 @@ static bool sl_parse_accelerators(struct wl_list* accelerator_list,
           modifiers |= SHIFT_MASK;
           accelerators += 7;
         } else {
-          fprintf(stderr, "error: invalid modifier\n");
+          LOG(ERROR) << "invalid modifier";
           return false;
         }
       } else {
@@ -3442,11 +3732,11 @@ static bool sl_parse_accelerators(struct wl_list* accelerator_list,
         accelerator->symbol =
             xkb_keysym_from_name(name, XKB_KEYSYM_CASE_INSENSITIVE);
         if (accelerator->symbol == XKB_KEY_NoSymbol) {
-          fprintf(stderr, "error: invalid key symbol\n");
+          LOG(ERROR) << "invalid key symbol";
           return false;
         }
 
-        wl_list_insert(accelerator_list, &accelerator->link);
+        accelerator_list.push_back(accelerator);
 
         modifiers = 0;
         accelerators = end;
@@ -3468,7 +3758,7 @@ int sl_open_wayland_socket(const char* socket_name,
 
   const char* runtime_dir = getenv("XDG_RUNTIME_DIR");
   if (!runtime_dir) {
-    fprintf(stderr, "error: XDG_RUNTIME_DIR not set in the environment\n");
+    LOG(ERROR) << "XDG_RUNTIME_DIR not set in the environment";
     return -1;
   }
 
@@ -3484,9 +3774,8 @@ int sl_open_wayland_socket(const char* socket_name,
 
   rv = flock(*lock_fd, LOCK_EX | LOCK_NB);
   if (rv < 0) {
-    fprintf(stderr,
-            "error: unable to lock %s, is another compositor running?\n",
-            lock_addr);
+    LOG(ERROR) << "error: unable to lock " << lock_addr
+               << ", is another compositor running?";
     return rv;
   }
   free(lock_addr);
@@ -3557,7 +3846,7 @@ int sl_run_parent(int argc,
 
     int client_fd = accept(sock_fd, (struct sockaddr*)&addr, &length);
     if (client_fd < 0) {
-      fprintf(stderr, "error: failed to accept: %m\n");
+      LOG(ERROR) << "failed to accept: " << strerror(errno);
       continue;
     }
 
@@ -3582,7 +3871,7 @@ int sl_run_parent(int argc,
 
         i = sl_parse_cmd_prefix(peer_cmd_prefix_str, 32, args);
         if (i > 32) {
-          fprintf(stderr, "error: too many arguments in cmd prefix: %d\n", i);
+          LOG(ERROR) << "too many arguments in cmd prefix: " << i;
           i = 0;
         }
       }
@@ -3602,7 +3891,9 @@ int sl_run_parent(int argc,
             strstr(arg, "--windowed-accelerators") == arg ||
             strstr(arg, "--drm-device") == arg ||
             strstr(arg, "--support-damage-buffer") == arg ||
-            strstr(arg, "--vm-identififer") == arg) {
+            strstr(arg, "--vm-identififer") == arg ||
+            strstr(arg, "--trace-system") == arg ||
+            strstr(arg, "--enable-linux-dmabuf") == arg) {
           args[i++] = arg;
         }
       }
@@ -3657,7 +3948,7 @@ void sl_spawn_xwayland(sl_context* ctx,
 
       i = sl_parse_cmd_prefix(xwayland_cmd_prefix_str, 32, args);
       if (i > 32) {
-        fprintf(stderr, "error: too many arguments in cmd prefix: %d\n", i);
+        LOG(ERROR) << "too many arguments in cmd prefix: " << i;
         i = 0;
       }
     }
@@ -3718,10 +4009,45 @@ void create_shims() {
   set_xdg_toplevel_shim(new XdgToplevelShim());
   set_xdg_surface_shim(new XdgSurfaceShim());
   set_xdg_wm_base_shim(new XdgWmBaseShim());
+  set_wp_viewport_shim(new WpViewportShim());
 
 #ifdef GAMEPAD_SUPPORT
   Libevdev::Set(new LibevdevShim());
 #endif
+}
+
+static WaylandChannel* try_wayland_channel_init(
+    WaylandChannel* channel, const char* channel_description) {
+  if (channel) {
+    int ret = channel->init();
+    if (ret) {
+      LOG(VERBOSE) << "WaylandChannel init for candidate '"
+                   << channel_description << "' failed: " << strerror(-ret);
+      delete channel;
+      channel = nullptr;
+    } else {
+      LOG(VERBOSE) << "WaylandChannel init for candidate '"
+                   << channel_description << "' succeeded.";
+    }
+  }
+  return channel;
+}
+
+WaylandChannel* sl_create_wayland_channel(bool try_virtgpu_channel) {
+  // defines a preferred channel ordering and attempt early init so we can
+  // fallback if necessary.
+  WaylandChannel* channel = nullptr;
+  if (try_virtgpu_channel) {
+    channel = try_wayland_channel_init(new VirtGpuChannel(), "VirtGpuChannel");
+  }
+  if (!channel) {
+    channel = try_wayland_channel_init(new VirtWaylandChannel(),
+                                       "VirtWaylandChannel");
+  }
+  if (!channel) {
+    LOG(ERROR) << "WaylandChannel init failed for all candidate backends";
+  }
+  return channel;
 }
 
 int real_main(int argc, char** argv) {
@@ -3750,9 +4076,11 @@ int real_main(int argc, char** argv) {
   const char* xauth_path = getenv("SOMMELIER_XAUTH_PATH");
   const char* xfont_path = getenv("SOMMELIER_XFONT_PATH");
   const char* vm_id = getenv("SOMMELIER_VM_IDENTIFIER");
+#ifdef QUIRKS_SUPPORT
+  const char* quirks_paths = getenv("SOMMELIER_QUIRKS_CONFIG");
+#endif
   const char* socket_name = "wayland-0";
   bool noop_driver = false;
-  struct wl_event_loop* event_loop;
   struct wl_listener client_destroy_listener = {};
   client_destroy_listener.notify = sl_client_destroy_notify;
   int sv[2];
@@ -3761,6 +4089,9 @@ int real_main(int argc, char** argv) {
   int parent = 0;
   int client_fd = -1;
   int i;
+  const char* stats_summary = nullptr;
+  const char* stats_log = nullptr;
+  bool use_virtgpu_channel = false;
 
   // Ignore SIGUSR1 (used for trace dumping) in all child processes.
   signal(SIGUSR1, SIG_IGN);
@@ -3776,8 +4107,32 @@ int real_main(int argc, char** argv) {
       printf("Version: %s\n", SOMMELIER_VERSION);
       return EXIT_SUCCESS;
     }
+#ifdef QUIRKS_SUPPORT
+    if (strstr(arg, "--print-enabled-features") == arg) {
+      if (!quirks_paths) {
+        LOG(FATAL) << "Env var SOMMELIER_QUIRKS_CONFIG must be set to quirks "
+                      "textproto path";
+        return EXIT_FAILURE;
+      }
+      Quirks quirks;
+      quirks.LoadFromCommaSeparatedFiles(quirks_paths);
+
+      int64_t steam_game_id = sl_arg_parse_int_checked(arg);
+      if (steam_game_id <= 0) {
+        LOG(FATAL) << "invalid value for arg '" << arg << "': " << steam_game_id
+                   << " (expected positive integer)";
+        return EXIT_FAILURE;
+      }
+      quirks.PrintFeaturesEnabled(steam_game_id);
+      return EXIT_SUCCESS;
+    }
+#endif
+
     if (strstr(arg, "--parent") == arg) {
       parent = 1;
+    } else if (strstr(arg, "--log-level") == arg) {
+      const int64_t log_level = sl_arg_parse_int_checked(arg);
+      logging::set_min_log_level(log_level);
     } else if (strstr(arg, "--socket") == arg) {
       socket_name = sl_arg_value(arg);
     } else if (strstr(arg, "--display") == arg) {
@@ -3843,22 +4198,42 @@ int real_main(int argc, char** argv) {
       ctx.timing = new Timing(sl_arg_value(arg));
     } else if (strstr(arg, "--explicit-fence") == arg) {
       ctx.use_explicit_fence = true;
+    } else if (strstr(arg, "--enable-linux-dmabuf") == arg) {
+      ctx.enable_linux_dmabuf = true;
     } else if (strstr(arg, "--enable-xshape") == arg) {
       ctx.enable_xshape = true;
     } else if (strstr(arg, "--enable-x11-move-windows") == arg) {
       ctx.enable_x11_move_windows = true;
     } else if (strstr(arg, "--virtgpu-channel") == arg) {
-      ctx.use_virtgpu_channel = true;
+      use_virtgpu_channel = true;
     } else if (strstr(arg, "--noop-driver") == arg) {
       noop_driver = true;
     } else if (strstr(arg, "--stable-scaling") == arg) {
       ctx.stable_scaling = true;
+    } else if (strstr(arg, "--viewport-resize") == arg) {
+      ctx.viewport_resize = true;
+    } else if (strstr(arg, "--allow-xwayland-emulate-screen-pos-size") == arg) {
+      ctx.allow_xwayland_emulate_screen_pos_size = true;
+    } else if (strstr(arg, "--ignore-stateless-toplevel-configure") == arg) {
+      ctx.ignore_stateless_toplevel_configure = true;
+    } else if (strstr(arg, "--only-client-can-exit-fullscreen") == arg) {
+      ctx.only_client_can_exit_fullscreen = true;
 #ifdef PERFETTO_TRACING
     } else if (strstr(arg, "--trace-filename") == arg) {
       ctx.trace_filename = sl_arg_value(arg);
     } else if (strstr(arg, "--trace-system") == arg) {
       ctx.trace_system = true;
 #endif
+#ifdef QUIRKS_SUPPORT
+    } else if (strstr(arg, "--quirks-config") == arg) {
+      quirks_paths = sl_arg_value(arg);
+#endif
+    } else if (strstr(arg, "--stats-summary") == arg) {
+      stats_summary = sl_arg_value(arg);
+    } else if (strstr(arg, "--stats-log") == arg) {
+      stats_log = sl_arg_value(arg);
+    } else if (strstr(arg, "--stats-timer") == arg) {
+      ctx.stats_timer_delay = atoi(sl_arg_value(arg)) * 1000;
     } else if (arg[0] == '-') {
       if (strcmp(arg, "--") == 0) {
         ctx.runprog = &argv[i + 1];
@@ -3866,7 +4241,7 @@ int real_main(int argc, char** argv) {
       }
       // Don't exit on unknown options so we can have forward compatibility
       // with new flags introduced.
-      fprintf(stderr, "Option `%s' is unknown, ignoring.\n", arg);
+      LOG(WARNING) << "option '" << arg << "' is unknown, ignoring";
     } else {
       ctx.runprog = &argv[i];
       break;
@@ -3882,12 +4257,10 @@ int real_main(int argc, char** argv) {
   }
 
   if (ctx.application_id && ctx.vm_id) {
-    fprintf(stderr, "warning: --application-id overrides --vm-identifier\n");
+    LOG(WARNING) << "--application-id overrides --vm-identifier";
   }
   if (ctx.application_id && ctx.application_id_property_name) {
-    fprintf(stderr,
-            "warning: --application-id overrides"
-            " --application-id-x11-property\n");
+    LOG(WARNING) << "--application-id overrides --application-id-x11-property";
   }
 
   if (parent) {
@@ -3942,13 +4315,19 @@ int real_main(int argc, char** argv) {
   ctx.support_damage_buffer = support_damage_buffer == nullptr ||
                               strcmp(support_damage_buffer, "1") == 0;
 
+#ifdef QUIRKS_SUPPORT
+  if (quirks_paths) {
+    ctx.quirks.LoadFromCommaSeparatedFiles(quirks_paths);
+  }
+#endif
+
   if (fullscreen_mode) {
     if (strcmp(fullscreen_mode, "immersive") == 0) {
       ctx.fullscreen_mode = ZAURA_SURFACE_FULLSCREEN_MODE_IMMERSIVE;
     } else if (strcmp(fullscreen_mode, "plain") == 0) {
       ctx.fullscreen_mode = ZAURA_SURFACE_FULLSCREEN_MODE_PLAIN;
     } else {
-      fprintf(stderr, "error: unrecognised --fullscreen-mode\n");
+      LOG(FATAL) << "unrecognised --fullscreen-mode";
       sl_print_usage();
       return EXIT_FAILURE;
     }
@@ -3957,45 +4336,59 @@ int real_main(int argc, char** argv) {
   // Handle broken pipes without signals that kill the entire process.
   signal(SIGPIPE, SIG_IGN);
 
-  ctx.host_display = wl_display_create();
-  assert(ctx.host_display);
+  wl_event_loop* event_loop = nullptr;
+  {
+    ScopeTimer timer("configure event loop");
+    // We use a wayland virtual context unless display name was explicitly
+    // specified.
+    const bool use_virtual_context = !display;
 
-  if (noop_driver) {
-    ctx.channel = nullptr;
-  } else if (ctx.use_virtgpu_channel) {
-    ctx.channel = new VirtGpuChannel();
-  } else {
-    ctx.channel = new VirtWaylandChannel();
-  }
-
-  event_loop = wl_display_get_event_loop(ctx.host_display);
-  if (!sl_context_init_wayland_channel(&ctx, event_loop, display)) {
-    return EXIT_FAILURE;
-  }
-
-  int drm_fd = -1;
-  char* drm_device = nullptr;
-  if (force_drm_device != nullptr) {
-    // Use DRM device specified on the command line.
-    drm_fd = open(force_drm_device, O_RDWR | O_CLOEXEC);
-    if (drm_fd == -1) {
-      fprintf(stderr, "error: could not open %s (%s)\n", force_drm_device,
-              strerror(errno));
-      return EXIT_FAILURE;
-    }
-    drm_device = strdup(force_drm_device);
-  } else {
-    // Enumerate render nodes to find the virtio_gpu device.
-    drm_fd = open_virtgpu(&drm_device);
-  }
-  if (drm_fd >= 0) {
-    ctx.gbm = gbm_create_device(drm_fd);
-    if (!ctx.gbm) {
-      fprintf(stderr, "error: couldn't get display device\n");
+    WaylandChannel* wayland_channel = nullptr;
+    if (!noop_driver) {
+      wayland_channel = sl_create_wayland_channel(use_virtgpu_channel);
+      if (!wayland_channel) {
+        LOG(FATAL) << "failed to initialize wayland channel.";
+        return EXIT_FAILURE;
+      }
+    } else if (use_virtual_context) {
+      LOG(FATAL) << "Must either provide a wayland display (--display=<name>) "
+                    "or use a virtual wayland channel (remove --noop-driver).";
       return EXIT_FAILURE;
     }
 
-    ctx.drm_device = drm_device;
+    event_loop = sl_context_configure_event_loop(&ctx, wayland_channel,
+                                                 use_virtual_context);
+    if (!event_loop) {
+      return EXIT_FAILURE;
+    }
+  }
+
+  {
+    ScopeTimer timer("drm device");
+    int drm_fd = -1;
+    char* drm_device = nullptr;
+    if (force_drm_device != nullptr) {
+      // Use DRM device specified on the command line.
+      drm_fd = open(force_drm_device, O_RDWR | O_CLOEXEC);
+      if (drm_fd == -1) {
+        LOG(FATAL) << "could not open " << force_drm_device << ": "
+                   << strerror(errno);
+        return EXIT_FAILURE;
+      }
+      drm_device = strdup(force_drm_device);
+    } else {
+      // Enumerate render nodes to find the virtio_gpu device.
+      drm_fd = open_virtgpu(&drm_device);
+    }
+    if (drm_fd >= 0) {
+      ctx.gbm = gbm_create_device(drm_fd);
+      if (!ctx.gbm) {
+        LOG(FATAL) << "couldn't get display device";
+        return EXIT_FAILURE;
+      }
+
+      ctx.drm_device = drm_device;
+    }
   }
 
   wl_array_init(&ctx.dpi);
@@ -4016,74 +4409,86 @@ int real_main(int argc, char** argv) {
   // The success of this depends on xkb-data being installed.
   ctx.xkb_context = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
   if (!ctx.xkb_context) {
-    fprintf(stderr, "error: xkb_context_new failed. xkb-data missing?\n");
+    LOG(FATAL) << "xkb_context_new failed. xkb-data missing?";
     return EXIT_FAILURE;
   }
 
-  if (ctx.virtwl_display_fd != -1) {
-    ctx.display = wl_display_connect_to_fd(ctx.virtwl_display_fd);
-  } else {
-    if (display == nullptr)
-      display = getenv("WAYLAND_DISPLAY");
-    if (display == nullptr)
-      display = "wayland-0";
-
-    ctx.display = wl_display_connect(display);
-  }
-
-  if (!ctx.display) {
-    fprintf(stderr, "error: failed to connect to %s\n", display);
-    return EXIT_FAILURE;
-  }
-
-  if (!sl_parse_accelerators(&ctx.accelerators, accelerators))
-    return EXIT_FAILURE;
-  if (!sl_parse_accelerators(&ctx.windowed_accelerators, windowed_accelerators))
-    return EXIT_FAILURE;
-
-  ctx.display_event_source.reset(
-      wl_event_loop_add_fd(event_loop, wl_display_get_fd(ctx.display),
-                           WL_EVENT_READABLE, sl_handle_event, &ctx));
-
-  wl_registry_add_listener(wl_display_get_registry(ctx.display),
-                           &sl_registry_listener, &ctx);
-
-  if (ctx.runprog || ctx.xwayland) {
-    // Wayland connection from client.
-    int rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
-    errno_assert(!rv);
-    client_fd = sv[0];
-  }
-
-  ctx.client = wl_client_create(ctx.host_display, client_fd);
-
-  // Replace the core display implementation. This is needed in order to
-  // implement sync handler properly.
-  sl_set_display_implementation(&ctx, ctx.client);
-
-  if (ctx.runprog || ctx.xwayland) {
-    ctx.sigchld_event_source.reset(
-        wl_event_loop_add_signal(event_loop, SIGCHLD, sl_handle_sigchld, &ctx));
-
-    if (ctx.xwayland) {
-      sl_spawn_xwayland(&ctx, event_loop, sv[1], xwayland_cmd_prefix,
-                        xwayland_path, xdisplay, xauth_path, xfont_path,
-                        xwayland_gl_driver_path, glamor);
+  {
+    ScopeTimer timer("connect display");
+    if (ctx.virtwl_display_fd != -1) {
+      ctx.display = wl_display_connect_to_fd(ctx.virtwl_display_fd);
     } else {
-      pid = fork();
-      errno_assert(pid != -1);
-      if (pid == 0) {
-        // Unset DISPLAY to prevent X clients from connecting to an existing X
-        // server when X forwarding is not enabled.
-        unsetenv("DISPLAY");
-        sl_execvp(ctx.runprog[0], ctx.runprog, sv[1]);
-        _exit(EXIT_FAILURE);
-      }
-      ctx.child_pid = pid;
+      if (display == nullptr)
+        display = getenv("WAYLAND_DISPLAY");
+      if (display == nullptr)
+        display = "wayland-0";
+
+      ctx.display = wl_display_connect(display);
     }
-    close(sv[1]);
+
+    if (!ctx.display) {
+      LOG(FATAL) << "failed to connect to " << display;
+      return EXIT_FAILURE;
+    }
+
+    if (!sl_parse_accelerators(ctx.accelerators, accelerators))
+      return EXIT_FAILURE;
+    if (!sl_parse_accelerators(ctx.windowed_accelerators,
+                               windowed_accelerators))
+      return EXIT_FAILURE;
+
+    ctx.display_event_source.reset(
+        wl_event_loop_add_fd(event_loop, wl_display_get_fd(ctx.display),
+                             WL_EVENT_READABLE, sl_handle_event, &ctx));
+
+    wl_registry_add_listener(wl_display_get_registry(ctx.display),
+                             &sl_registry_listener, &ctx);
   }
 
+  {
+    ScopeTimer timer("client create");
+    if (ctx.runprog || ctx.xwayland) {
+      // Wayland connection from client.
+      int rv = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
+      errno_assert(!rv);
+      client_fd = sv[0];
+    }
+
+    ctx.client = wl_client_create(ctx.host_display, client_fd);
+  }
+
+  {
+    ScopeTimer timer("display implementation");
+    // Replace the core display implementation. This is needed in order to
+    // implement sync handler properly.
+    sl_set_display_implementation(&ctx, ctx.client);
+  }
+
+  {
+    ScopeTimer timer("spawn xwayland");
+    if (ctx.runprog || ctx.xwayland) {
+      ctx.sigchld_event_source.reset(wl_event_loop_add_signal(
+          event_loop, SIGCHLD, sl_handle_sigchld, &ctx));
+
+      if (ctx.xwayland) {
+        sl_spawn_xwayland(&ctx, event_loop, sv[1], xwayland_cmd_prefix,
+                          xwayland_path, xdisplay, xauth_path, xfont_path,
+                          xwayland_gl_driver_path, glamor);
+      } else {
+        pid = fork();
+        errno_assert(pid != -1);
+        if (pid == 0) {
+          // Unset DISPLAY to prevent X clients from connecting to an existing X
+          // server when X forwarding is not enabled.
+          unsetenv("DISPLAY");
+          sl_execvp(ctx.runprog[0], ctx.runprog, sv[1]);
+          _exit(EXIT_FAILURE);
+        }
+        ctx.child_pid = pid;
+      }
+      close(sv[1]);
+    }
+  }
   // Attempt to enable tracing.  This could be called earlier but would rather
   // spawn all children first.
   const bool tracing_needed = ctx.trace_filename || ctx.trace_system;
@@ -4103,8 +4508,17 @@ int real_main(int argc, char** argv) {
     ctx.timing->RecordStartTime();
   }
 
+  if (stats_summary != nullptr || stats_log != nullptr) {
+    ctx.frame_stats.reset(new FrameStats(stats_summary, stats_log));
+    ctx.stats_timer_event_source.reset(
+        wl_event_loop_add_timer(event_loop, sl_handle_stats_timer, &ctx));
+    wl_event_source_timer_update(ctx.stats_timer_event_source.get(),
+                                 ctx.stats_timer_delay);
+  }
+
   wl_client_add_destroy_listener(ctx.client, &client_destroy_listener);
 
+  LOG(VERBOSE) << "starting main loop";
   while (true) {
     wl_display_flush_clients(ctx.host_display);
     if (ctx.connection) {

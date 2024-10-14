@@ -3,12 +3,15 @@
 // found in the LICENSE file.
 
 #include "../sommelier.h"            // NOLINT(build/include_directory)
+#include "../sommelier-logging.h"    // NOLINT(build/include_directory)
 #include "../sommelier-timing.h"     // NOLINT(build/include_directory)
 #include "../sommelier-tracing.h"    // NOLINT(build/include_directory)
 #include "../sommelier-transform.h"  // NOLINT(build/include_directory)
+#include "../sommelier-window.h"     // NOLINT(build/include_directory)
 #include "../sommelier-xshape.h"     // NOLINT(build/include_directory)
-#include "sommelier-dma-buf.h"       // NOLINT(build/include_directory)
-
+#include "sommelier-dmabuf-sync.h"   // NOLINT(build/include_directory)
+#include "sommelier-formats.h"       // NOLINT(build/include_directory)
+#include "viewporter-shim.h"         // NOLINT(build/include_directory)
 #include <assert.h>
 #include <errno.h>
 #include <libdrm/drm_fourcc.h>
@@ -25,6 +28,7 @@
 #include "linux-dmabuf-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #include "linux-explicit-synchronization-unstable-v1-client-protocol.h"  // NOLINT(build/include_directory)
 #include "viewporter-client-protocol.h"  // NOLINT(build/include_directory)
+#include "xdg-shell-client-protocol.h"   // NOLINT(build/include_directory)
 
 struct sl_host_compositor {
   struct sl_compositor* compositor;
@@ -158,6 +162,7 @@ static void sl_host_surface_attach(struct wl_client* client,
   // Transfer the flag and shape data over to the surface
   // if we are working on a shaped window
   if (window_shaped) {
+    assert(sl_shm_format_is_supported(host_buffer->shm_format));
     host->contents_shaped = true;
     pixman_region32_copy(&host->contents_shape, &window->shape_rectangles);
   } else {
@@ -196,8 +201,8 @@ static void sl_host_surface_attach(struct wl_client* client,
       size_t height = host_buffer->height;
       uint32_t shm_format =
           window_shaped ? WL_SHM_FORMAT_ARGB8888 : host_buffer->shm_format;
-      size_t bpp = sl_shm_bpp_for_shm_format(shm_format);
-      size_t num_planes = sl_shm_num_planes_for_shm_format(shm_format);
+      size_t bpp = sl_shm_format_bpp(shm_format);
+      size_t num_planes = sl_shm_format_num_planes(shm_format);
 
       host->current_buffer = new sl_output_buffer();
       wl_list_insert(&host->released_buffers, &host->current_buffer->link);
@@ -219,7 +224,8 @@ static void sl_host_surface_attach(struct wl_client* client,
         host->current_buffer->shape_image = nullptr;
       }
 
-      if (host->ctx->channel->supports_dmabuf()) {
+      if (host->ctx->channel->supports_dmabuf() &&
+          host->ctx->linux_dmabuf->proxy_v2) {
         int rv;
         size_t size;
         struct zwp_linux_buffer_params_v1* buffer_params;
@@ -229,18 +235,17 @@ static void sl_host_surface_attach(struct wl_client* client,
 
         create_info.width = static_cast<__u32>(width);
         create_info.height = static_cast<__u32>(height);
-        create_info.drm_format = sl_drm_format_for_shm_format(shm_format);
+        create_info.drm_format = sl_shm_format_to_drm_format(shm_format);
 
         rv = host->ctx->channel->allocate(create_info, create_output);
         if (rv) {
-          fprintf(stderr, "error: virtwl dmabuf allocation failed: %s\n",
-                  strerror(-rv));
+          LOG(FATAL) << "virtwl dmabuf allocation failed: " << strerror(-rv);
           _exit(EXIT_FAILURE);
         }
 
         size = create_output.host_size;
         buffer_params = zwp_linux_dmabuf_v1_create_params(
-            host->ctx->linux_dmabuf->internal);
+            host->ctx->linux_dmabuf->proxy_v2);
         zwp_linux_buffer_params_v1_add(buffer_params, create_output.fd, 0,
                                        create_output.offsets[0],
                                        create_output.strides[0], 0, 0);
@@ -327,14 +332,11 @@ static void sl_host_surface_attach(struct wl_client* client,
           // of guest side sync going forward.
           zwp_linux_surface_synchronization_v1_destroy(host->surface_sync);
           host->surface_sync = nullptr;
-          fprintf(stderr,
-                  "DMA_BUF_IOCTL_EXPORT_SYNC_FILE not implemented, defaulting "
-                  "to implicit fence for synchronization.\n");
+          LOG(INFO) << "DMA_BUF_IOCTL_EXPORT_SYNC_FILE not implemented, "
+                       "defaulting to implicit fence for synchronization";
         } else {
-          fprintf(stderr,
-                  "Explicit synchronization failed with reason: %s. "
-                  "Will retry on next attach.\n",
-                  strerror(ret));
+          LOG(WARNING) << "Explicit synchronization failed with reason: "
+                       << strerror(ret) << ", will retry on next attach";
         }
       } else {
         if (sl_dmabuf_sync_is_virtgpu(sync_file_fd)) {
@@ -372,7 +374,7 @@ static void sl_host_surface_attach(struct wl_client* client,
       break;
     }
   }
-}  // NOLINT(whitespace/indent)
+}
 
 // Return the scale and offset from surface coordinates to buffer pixel
 // coordinates, taking the viewport into account (if any).
@@ -597,8 +599,8 @@ static void copy_damaged_rect(sl_host_surface* host,
   }
 }
 
-static void sl_host_surface_commit(struct wl_client* client,
-                                   struct wl_resource* resource) {
+void sl_host_surface_commit(struct wl_client* client,
+                            struct wl_resource* resource) {
   auto resource_id = try_wl_resource_get_id(resource);
   TRACE_EVENT(
       "surface", "sl_host_surface_commit", "resource_id", resource_id,
@@ -608,6 +610,7 @@ static void sl_host_surface_commit(struct wl_client* client,
   if (host->ctx->timing != nullptr) {
     host->ctx->timing->UpdateLastCommit(resource_id);
   }
+  struct sl_window* window = host->window;
   struct sl_viewport* viewport = nullptr;
 
   if (!wl_list_empty(&host->contents_viewport))
@@ -734,16 +737,30 @@ static void sl_host_surface_commit(struct wl_client* client,
           width = viewport->dst_width;
           height = viewport->dst_height;
         }
+      } else {
+        // Reset the host viewport if client viewport does not exist
+        // TODO(b/328699937): There may be a bug/race in this section with
+        // another part of Sommelier, leading to buffer size mismatch in
+        // fullscreen mode.
+        wl_fixed_t negative_one = wl_fixed_from_int(-1);
+        wp_viewport_set_source(host->viewport, negative_one, negative_one,
+                               negative_one, negative_one);
       }
 
       int32_t vp_width = width;
       int32_t vp_height = height;
-
       // Consult with the transform function to see if the
       // viewport destination set is necessary
       if (sl_transform_viewport_scale(host->ctx, host, host->contents_scale,
                                       &vp_width, &vp_height)) {
-        wp_viewport_set_destination(host->viewport, vp_width, vp_height);
+        wp_viewport_shim()->set_destination(host->viewport, vp_width,
+                                            vp_height);
+        if (window) {
+          window->viewport_width_realized = vp_width;
+          window->viewport_height_realized = vp_height;
+        }
+      } else {
+        wp_viewport_shim()->set_destination(host->viewport, -1, -1);
       }
     } else {
       wl_surface_set_buffer_scale(host->proxy, scale);
@@ -788,6 +805,25 @@ static void sl_host_surface_commit(struct wl_client* client,
     }
   }
 
+  // Log frame stats.
+  if (host->ctx->frame_stats != nullptr) {
+    // Try and find a matching window to identify steam game id and
+    // activation status.
+    // TODO(davidriley): This ideally isn't doing a linear search each frame.
+    uint32_t steam_game_id = 0;
+    bool activated = false;
+    struct sl_window* window;
+    wl_list_for_each(window, &host->ctx->windows, link) {
+      if (window->host_surface_id == try_wl_resource_get_id(resource)) {
+        steam_game_id = window->steam_game_id;
+        activated = window->activated;
+        break;
+      }
+    }
+
+    host->ctx->frame_stats->AddFrame(resource_id, steam_game_id, activated);
+  }
+
   if (host->contents_shm_mmap) {
     if (host->contents_shm_mmap->buffer_resource) {
       wl_buffer_send_release(host->contents_shm_mmap->buffer_resource);
@@ -795,6 +831,21 @@ static void sl_host_surface_commit(struct wl_client* client,
     sl_mmap_end_access(host->contents_shm_mmap);
     sl_mmap_unref(host->contents_shm_mmap);
     host->contents_shm_mmap = nullptr;
+  }
+
+  if (window && sl_window_is_containerized(window)) {
+    // Force borderless windows to be fullscreen if
+    // window->borderless_window_check - this value is set to true when
+    // client sends NET_WM_STATE_REMOVE for ATOM_NET_WM_STATE_FULLSCREEN.
+    if (!window->fullscreen && !window->decorated &&
+        !window->compositor_fullscreen && window->maybe_promote_to_fullscreen &&
+        !window->iconified && window->activated) {
+      window->maybe_promote_to_fullscreen = false;
+      // Requesting Exo to set the window to fullscreen will result in
+      // toplevel_configure, which updates the states (and
+      // compositor_fullscreen is set appropriately as per request).
+      xdg_toplevel_set_fullscreen(window->xdg_toplevel, nullptr);
+    }
   }
 }
 

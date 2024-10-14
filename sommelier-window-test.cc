@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+#include "mock-viewporter-shim.h"  // NOLINT(build/include_directory)
 #include "testing/x11-test-base.h"
 
 #include <gmock/gmock.h>
@@ -13,6 +14,11 @@
 #include <wayland-util.h>
 #include <xcb/xcb.h>
 #include <xcb/xproto.h>
+#include <cstdint>
+
+#ifdef QUIRKS_SUPPORT
+#include "quirks/sommelier-quirks.h"
+#endif
 
 namespace vm_tools {
 namespace sommelier {
@@ -22,6 +28,220 @@ using ::testing::AllOf;
 using ::testing::PrintToString;
 
 using X11Test = X11TestBase;
+
+TEST_F(X11DirectScaleTest, ViewportOverrideStretchedVertically) {
+  // Arrange
+  ctx.viewport_resize = true;
+  AdvertiseOutputs(xwayland.get(),
+                   {{.logical_width = 1536, .logical_height = 864}});
+  sl_window* window = CreateToplevelWindow();
+  const int pixel_width = 1920;
+  const int pixel_height = 1080;
+  window->managed = true;
+  window->max_width = pixel_width;
+  window->min_height = pixel_height;
+  window->min_width = pixel_width;
+  window->max_height = pixel_height;
+  window->width = pixel_width;
+  window->height = pixel_height;
+  window->paired_surface->contents_width = pixel_width;
+  window->paired_surface->contents_height = pixel_height;
+  wl_array states;
+  wl_array_init(&states);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, 1393, 784))
+      .Times(1);
+
+  // Act: Configure with height smaller than min_height.
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 1536 /*1920*/, 784 /*980*/,
+                  &states);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 123);
+  sl_host_surface_commit(nullptr, window->paired_surface->resource);
+  Pump();
+
+  // Assert: viewport size and pointer scale are set, width height are
+  // unchanged.
+  EXPECT_TRUE(window->viewport_override);
+  EXPECT_EQ(window->viewport_width, 1393);
+  EXPECT_EQ(window->viewport_height, 784);
+  EXPECT_FLOAT_EQ(window->viewport_pointer_scale, 1.1026561);
+  EXPECT_EQ(window->width, 1920);
+  EXPECT_EQ(window->height, 1080);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, -1, -1))
+      // Act: Configure with the size that is within the window bounds.
+      .Times(1);
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 1536, 864, &states);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 124);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, 1536, 864))
+      .Times(1);
+
+  // Act
+  sl_host_surface_commit(nullptr, window->paired_surface->resource);
+  Pump();
+
+  // Assert: viewport override is no longer used.
+  EXPECT_FALSE(window->viewport_override);
+  EXPECT_EQ(window->viewport_width, -1);
+  EXPECT_EQ(window->viewport_height, -1);
+  EXPECT_EQ(window->width, pixel_width);
+  EXPECT_EQ(window->height, pixel_height);
+}
+
+TEST_F(X11DirectScaleTest, ViewportOverrideStretchedHorizontally) {
+  // Arrange
+  ctx.viewport_resize = true;
+  AdvertiseOutputs(xwayland.get(),
+                   {{.logical_width = 1536, .logical_height = 864}});
+  sl_window* window = CreateToplevelWindow();
+  window->managed = true;
+  window->max_width = 1700;
+  window->max_height = 900;
+  window->min_width = 1600;
+  window->min_height = 800;
+  window->width = 1650;
+  window->height = 800;
+  window->paired_surface->contents_width = 1650;
+  window->paired_surface->contents_height = 800;
+  wl_array states;
+  wl_array_init(&states);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, 1200, 581))
+      .Times(1);
+
+  // Act: Height is set to equal to max height, width smaller than min
+  // width.
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 1200 /*1500*/, 720 /*900*/,
+                  &states);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 123);
+  sl_host_surface_commit(nullptr, window->paired_surface->resource);
+  Pump();
+
+  // Assert: viewport size and pointer scale are set, width height are
+  // unchanged.
+  EXPECT_TRUE(window->viewport_override);
+  EXPECT_EQ(window->viewport_width, 1200);
+  EXPECT_EQ(window->viewport_height, 581);
+  EXPECT_FLOAT_EQ(window->viewport_pointer_scale, 1.1);
+  EXPECT_EQ(window->width, 1650);
+  EXPECT_EQ(window->height, 800);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, -1, -1))
+      .Times(1);
+
+  // Act: Configure with the size that is within the window bounds.
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 1360 /*1700*/, 680 /*850*/,
+                  &states);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 124);
+  window->paired_surface->contents_width = 1700;
+  window->paired_surface->contents_height = 850;
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, 1360, 680))
+      .Times(1);
+
+  // Act
+  sl_host_surface_commit(nullptr, window->paired_surface->resource);
+  Pump();
+
+  // Assert: viewport override is no longer used.
+  EXPECT_FALSE(window->viewport_override);
+  EXPECT_EQ(window->viewport_width, -1);
+  EXPECT_EQ(window->viewport_height, -1);
+  EXPECT_EQ(window->width, 1700);
+  EXPECT_EQ(window->height, 850);
+}
+
+TEST_F(X11DirectScaleTest, ViewportOverrideSameAspectRatio) {
+  // Arrange
+  ctx.viewport_resize = true;
+  AdvertiseOutputs(xwayland.get(),
+                   {{.logical_width = 1536, .logical_height = 864}});
+  sl_window* window = CreateToplevelWindow();
+  window->managed = true;
+  const int pixel_width = 1920;
+  const int pixel_height = 1080;
+  window->max_width = pixel_width;
+  window->min_height = pixel_height;
+  window->min_width = pixel_width;
+  window->max_height = pixel_height;
+  window->paired_surface->contents_width = pixel_width;
+  window->paired_surface->contents_height = pixel_height;
+  window->width = pixel_width;
+  window->height = pixel_height;
+  wl_array states;
+  wl_array_init(&states);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, 1280, 720))
+      .Times(1);
+
+  // Act: Height and width squished while maintaining aspect ratio.
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 1280 /*1600*/, 720 /*900*/,
+                  &states);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 123);
+  sl_host_surface_commit(nullptr, window->paired_surface->resource);
+  Pump();
+
+  // Assert: viewport size and pointer scale are set, width height are
+  // unchanged.
+  EXPECT_TRUE(window->viewport_override);
+  EXPECT_EQ(window->viewport_width, 1280);
+  EXPECT_EQ(window->viewport_height, 720);
+  EXPECT_FLOAT_EQ(window->viewport_pointer_scale, 1.2);
+  EXPECT_EQ(window->width, pixel_width);
+  EXPECT_EQ(window->height, pixel_height);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, -1, -1))
+      .Times(1);
+
+  // Act: Configure with the size that is within the window bounds.
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 1536, 864, &states);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 123);
+
+  // Assert
+  EXPECT_CALL(mock_viewport_shim_,
+              set_destination(window->paired_surface->viewport, 1536, 864))
+      .Times(1);
+
+  // Act
+  sl_host_surface_commit(nullptr, window->paired_surface->resource);
+  Pump();
+
+  // Assert: viewport override is no longer used.
+  EXPECT_FALSE(window->viewport_override);
+  EXPECT_EQ(window->viewport_width, -1);
+  EXPECT_EQ(window->viewport_height, -1);
+  EXPECT_EQ(window->width, 1920);
+  EXPECT_EQ(window->height, 1080);
+}
 
 TEST_F(X11Test, TogglesFullscreenOnWmStateFullscreen) {
   // Arrange: Create an xdg_toplevel surface. Initially it's not fullscreen.
@@ -321,12 +541,19 @@ TEST_F(X11Test, NonExistentWindowDoesNotCrash) {
   sl_handle_reparent_notify(&ctx, &reparent_event);
 }
 
-#ifdef BLACK_SCREEN_FIX
+#ifdef QUIRKS_SUPPORT
 TEST_F(X11Test, IconifySuppressesFullscreen) {
   // Arrange: Create an xdg_toplevel surface. Initially it's not iconified.
   sl_window* window = CreateToplevelWindow();
   uint32_t xdg_toplevel_id = XdgToplevelId(window);
   EXPECT_EQ(window->iconified, 0);
+
+  window->steam_game_id = 123;
+  ctx.quirks.Load(
+      "sommelier { \n"
+      "  condition { steam_game_id: 123 }\n"
+      "  enable: FEATURE_BLACK_SCREEN_FIX\n"
+      "}");
 
   // Act: Pretend an X11 client owns the surface, and requests to iconify it.
   xcb_client_message_event_t event;
@@ -379,6 +606,13 @@ TEST_F(X11Test, IconifySuppressesUnmaximize) {
   sl_window* window = CreateToplevelWindow();
   uint32_t xdg_toplevel_id = XdgToplevelId(window);
   EXPECT_EQ(window->iconified, 0);
+
+  window->steam_game_id = 123;
+  ctx.quirks.Load(
+      "sommelier { \n"
+      "  condition { steam_game_id: 123 }\n"
+      "  enable: FEATURE_BLACK_SCREEN_FIX\n"
+      "}");
 
   // Arrange: Maximize it.
   xcb_client_message_event_t event;
@@ -435,7 +669,7 @@ TEST_F(X11Test, IconifySuppressesUnmaximize) {
       .Times(1);
   Pump();
 }
-#endif  // BLACK_SCREEN_FIX
+#endif  // QUIRKS_SUPPORT
 
 // Matcher for the value_list argument of an X11 ConfigureWindow request,
 // which is a const void* pointing to an int array whose size is implied by
@@ -448,6 +682,20 @@ MATCHER_P(ValueListMatches, expected, "") {
   }
   *result_listener << PrintToString(values);
   return values == expected;
+}
+
+// Matcher for the data argument of an X11 ChangeProperty request,
+// which is a const void* pointing to an uint32_t array whose size is implied by
+// the flags argument. Hence, this does not test if argument exceeds the size of
+// expected since we have to explicitly state the size in the function call.
+MATCHER_P(ChangePropertyDataMatches, expected, "") {
+  const uint32_t* received = static_cast<const uint32_t*>(arg);
+  for (uint32_t i = 0; i < expected.size(); i++) {
+    if (received[i] != expected[i]) {
+      return false;
+    }
+  }
+  return true;
 }
 
 TEST_F(X11Test, XdgToplevelConfigureTriggersX11Configure) {
@@ -825,6 +1073,97 @@ TEST_F(X11Test, X11ConfigureRequestWithoutPositionIsNotForwardedToAuraHost) {
       .height = 400,
       .value_mask = XCB_CONFIG_WINDOW_WIDTH | XCB_CONFIG_WINDOW_HEIGHT};
   sl_handle_configure_request(&ctx, &configure);
+  Pump();
+}
+
+TEST_F(X11Test, X11OnlyClientCanExitFullScreenIfFlagSet) {
+  // Arrange
+  AdvertiseOutputs(xwayland.get(), {OutputConfig()});
+  sl_window* window = CreateToplevelWindow();
+  // pretend window is mapped and fullscreen
+  window->managed = 1;
+  window->fullscreen = true;
+  window->compositor_fullscreen = true;
+  window->allow_resize = false;
+
+  // No states from Wayland - which means non-fullscreen
+  struct wl_array states;
+  wl_array_init(&states);
+
+  // Test with the flag set. X11 next_config.state is set to fullscreen to
+  // retain fullscreen.
+  ctx.only_client_can_exit_fullscreen = true;
+  window->next_config.states_length = 0;
+
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 800, 600, &states);
+
+  // window->fullscreen is not updated by sl_internal_toplevel_configure.
+  // It is done by X11 notifying property change, hence we only test
+  // compositor_fullscreen here.
+  ASSERT_EQ(window->next_config.states_length, 1);
+  ASSERT_EQ(window->next_config.states[0],
+            window->ctx->atoms[ATOM_NET_WM_STATE_FULLSCREEN].value);
+
+  ASSERT_FALSE(window->compositor_fullscreen);
+  ASSERT_FALSE(window->allow_resize);
+}
+
+TEST_F(X11Test, X11ExitFullScreenIfFlagNotSet) {
+  // Arrange
+  AdvertiseOutputs(xwayland.get(), {OutputConfig()});
+  sl_window* window = CreateToplevelWindow();
+  // pretend window is mapped and fullscreen
+  window->managed = 1;
+  window->fullscreen = true;
+  window->compositor_fullscreen = true;
+  window->allow_resize = false;
+
+  // No states from Wayland - which means non-fullscreen
+  struct wl_array states;
+  wl_array_init(&states);
+
+  // Test with without flag set. X11 next_config.state no longer includes
+  // fullscreen.
+  ctx.only_client_can_exit_fullscreen = false;
+  window->next_config.states_length = 0;
+
+  HostEventHandler(window->xdg_toplevel)
+      ->configure(nullptr, window->xdg_toplevel, 800, 600, &states);
+
+  // Compositor will treat the window as non-fullscreen and allow resize.
+  // Since no next_config is defined, follow up xcb()->change_property()
+  // will be called without any states - indicating the window is no
+  // longer fullscreen.
+  ASSERT_EQ(window->next_config.states_length, 0);
+
+  ASSERT_FALSE(window->compositor_fullscreen);
+  ASSERT_TRUE(window->allow_resize);
+}
+
+TEST_F(X11Test, X11NextConfigFullscreenStateConsumedCorrectly) {
+  // Arrange
+  AdvertiseOutputs(xwayland.get(), {OutputConfig()});
+  sl_window* window = CreateToplevelWindow();
+  // pretend window is mapped and fullscreen
+  window->managed = 1;
+  window->fullscreen = true;
+  window->compositor_fullscreen = true;
+  window->allow_resize = false;
+
+  // set fullscreen
+  window->next_config.states_length = 1;
+  window->next_config.states[0] =
+      window->ctx->atoms[ATOM_NET_WM_STATE_FULLSCREEN].value;
+
+  EXPECT_CALL(xcb, change_property(
+                       testing::_, XCB_PROP_MODE_REPLACE, window->id,
+                       ctx.atoms[ATOM_NET_WM_STATE].value, XCB_ATOM_ATOM, 32, 1,
+                       ChangePropertyDataMatches(std::vector(
+                           {ctx.atoms[ATOM_NET_WM_STATE_FULLSCREEN].value}))))
+      .Times(1);
+  HostEventHandler(window->xdg_surface)
+      ->configure(nullptr, window->xdg_surface, 0);
   Pump();
 }
 

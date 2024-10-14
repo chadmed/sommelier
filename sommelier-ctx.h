@@ -17,6 +17,10 @@
 #include "sommelier-util.h"    // NOLINT(build/include_directory)
 #include "virtualization/wayland_channel.h"
 
+#ifdef QUIRKS_SUPPORT
+#include "quirks/sommelier-quirks.h"
+#endif
+
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 
@@ -57,10 +61,19 @@ enum {
   ATOM_INCR,
   ATOM_WL_SELECTION,
   ATOM_GTK_THEME_VARIANT,
+  ATOM_STEAM_GAME,
   ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS,
-  ATOM_LAST = ATOM_XWAYLAND_RANDR_EMU_MONITOR_RECTS,
+  ATOM_SOMMELIER_QUIRK_APPLIED,
+  ATOM_NET_WM_WINDOW_TYPE,
+  ATOM_NET_WM_WINDOW_TYPE_NORMAL,
+  ATOM_NET_WM_WINDOW_TYPE_DIALOG,
+  ATOM_NET_WM_WINDOW_TYPE_SPLASH,
+  ATOM_NET_WM_WINDOW_TYPE_UTILITY,
+  ATOM_NET_WM_PID,
+  ATOM_LAST = ATOM_NET_WM_PID,
 };
 
+// A series of configurations and objects shared globally.
 struct sl_context {
   char** runprog;
 
@@ -94,6 +107,8 @@ struct sl_context {
   struct sl_stylus_input_manager* stylus_input_manager;
   struct sl_relative_pointer_manager* relative_pointer_manager;
   struct sl_pointer_constraints* pointer_constraints;
+  struct sl_fractional_scale_manager* fractional_scale_manager;
+  struct sl_idle_inhibit_manager* idle_inhibit_manager;
   struct wl_list outputs;
   struct wl_list seats;
   std::unique_ptr<struct wl_event_source> display_event_source;
@@ -101,6 +116,7 @@ struct sl_context {
   std::unique_ptr<struct wl_event_source> sigchld_event_source;
   std::unique_ptr<struct wl_event_source> sigusr1_event_source;
   std::unique_ptr<struct wl_event_source> clipboard_event_source;
+  std::unique_ptr<struct wl_event_source> stats_timer_event_source;
   struct wl_array dpi;
   int wm_fd;
   int wayland_channel_fd;
@@ -118,8 +134,8 @@ struct sl_context {
   pid_t child_pid;
   pid_t peer_pid;
   struct xkb_context* xkb_context;
-  struct wl_list accelerators;
-  struct wl_list windowed_accelerators;
+  std::vector<struct sl_accelerator*> accelerators;
+  std::vector<struct sl_accelerator*> windowed_accelerators;
   struct wl_list registries;
   struct wl_list globals;
   std::vector<struct sl_host_output*> host_outputs;
@@ -136,7 +152,11 @@ struct sl_context {
 #ifdef GAMEPAD_SUPPORT
   struct wl_list gamepads;
 #endif
+  // The scale provided by the --scale argument to sommelier.
   double desired_scale;
+  // The calculated value of desired_scale * default_scale. Default scale is the
+  // device_scale_factor * preferred_scale (usually preferred_scale = 1) of the
+  // internal screen (which is assumed to be the first output).
   double scale;
 
   // These scale factors are used for the direct scaling mode.
@@ -193,16 +213,25 @@ struct sl_context {
   xcb_colormap_t colormaps[256];
   Timing* timing;
   const char* trace_filename;
+#ifdef QUIRKS_SUPPORT
+  Quirks quirks;
+#endif
+  std::unique_ptr<FrameStats> frame_stats;
+  int stats_timer_delay;
 
   // Command-line configurable options.
   bool trace_system;
   bool use_explicit_fence;
-  bool use_virtgpu_channel;
   bool use_direct_scale;
+  bool viewport_resize;
+  bool allow_xwayland_emulate_screen_pos_size;
+  bool ignore_stateless_toplevel_configure;
+  bool only_client_can_exit_fullscreen;
 
   // Experimental feature flags to be cleaned up.
   bool enable_x11_move_windows;  // TODO(b/247452928): Clean this up.
   bool enable_xshape;            // TODO(b/281929016): Clean this up.
+  bool enable_linux_dmabuf;      // TODO(b/234899270): enable by default
   bool stable_scaling;           // TODO(b/275623126): Clean this up.
 
   // Never freed after allocation due the fact sommelier doesn't have a
@@ -222,9 +251,9 @@ const char* sl_context_atom_name(int atom_enum);
 
 void sl_context_init_default(struct sl_context* ctx);
 
-bool sl_context_init_wayland_channel(struct sl_context* ctx,
-                                     struct wl_event_loop* event_loop,
-                                     bool display);
+wl_event_loop* sl_context_configure_event_loop(sl_context* ctx,
+                                               WaylandChannel* channel,
+                                               bool use_virtual_context);
 
 sl_window* sl_context_lookup_window_for_surface(struct sl_context* ctx,
                                                 wl_resource* resource);

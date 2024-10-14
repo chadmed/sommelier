@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "sommelier.h"          // NOLINT(build/include_directory)
+#include "sommelier-logging.h"  // NOLINT(build/include_directory)
 #include "sommelier-tracing.h"  // NOLINT(build/include_directory)
 
 #include <assert.h>
@@ -68,11 +69,6 @@ struct std::hash<DeviceID> {
   }
 };
 
-struct InputMapping {
-  const char* id;
-  const std::unordered_map<uint32_t, uint32_t> mapping;
-};
-
 // Buttons being emulated by libevdev uinput.
 // Note: Do not enable BTN_TL2 or BTN_TR2, as they will significantly
 // change the Linux joydev interpretation of the triggers on ABS_Z/ABS_RZ.
@@ -125,6 +121,11 @@ const DeviceID kDualSenseUSB = {
 
 const DeviceID kDualSenseBT = {
     .vendor = kSonyVendor, .product = kDualSenseProduct, .version = 0x100};
+
+// There's currently a quirk that causes Dualsense gamepads to have 0x000 as
+// their version when connected over BT after a ChromeOS reboot.
+const DeviceID kDualSenseBuggedBT = {
+    .vendor = kSonyVendor, .product = kDualSenseProduct, .version = 0x000};
 
 const DeviceID kDualSenseEdgeUSB = {
     .vendor = kSonyVendor, .product = kDualSenseEdgeProduct, .version = 0x111};
@@ -389,6 +390,7 @@ const std::unordered_map<DeviceID, const InputMapping*> kDeviceMappings = {
     {kStratusPlusBT, &kAxisQuirkMapping},
     {kDualSenseUSB, &kDualSenseMapping},
     {kDualSenseBT, &kDualSenseMapping},
+    {kDualSenseBuggedBT, &kDualSenseMapping},
     {kDualShock4v2USB, &kDualShock4Mapping},
     {kDualShock4v2BT, &kDualShock4Mapping},
     {kDualShock3USB, &kDualShock3Mapping},
@@ -431,13 +433,7 @@ static void sl_internal_gamepad_removed(void* data,
   zcr_gamepad_v2_destroy(gamepad);
 
   wl_list_remove(&host_gamepad->link);
-  fprintf(
-      stderr,
-      "info: Gamepad removed: name=%s, bus=%u, vendor_id=%x, product_id=%x, "
-      "version=%x, input_mapping=%s \n",
-      host_gamepad->name, host_gamepad->bus, host_gamepad->vendor_id,
-      host_gamepad->product_id, host_gamepad->version,
-      (host_gamepad->input_mapping) ? host_gamepad->input_mapping->id : "none");
+  LOG(INFO) << "Gamepad removed: " << host_gamepad;
   delete host_gamepad;
 }
 
@@ -552,8 +548,7 @@ static void sl_internal_gamepad_axis_added(void* data,
                                .flat = flat,
                                .resolution = resolution};
   if (host_gamepad->state != kStatePending) {
-    fprintf(stderr, "error: %s invoked in unexpected state %d\n", __func__,
-            host_gamepad->state);
+    LOG(ERROR) << "invoked in unexpected state " << host_gamepad->state;
     host_gamepad->state = kStateError;
     return;
   }
@@ -571,8 +566,7 @@ static void sl_internal_gamepad_activated(void* data,
   struct sl_host_gamepad* host_gamepad = (struct sl_host_gamepad*)data;
 
   if (host_gamepad->state != kStatePending) {
-    fprintf(stderr, "error: %s invoked in unexpected state %d\n", __func__,
-            host_gamepad->state);
+    LOG(ERROR) << "invoked in unexpected state " << host_gamepad->state;
     host_gamepad->state = kStateError;
     return;
   }
@@ -584,9 +578,8 @@ static void sl_internal_gamepad_activated(void* data,
     // TODO(kenalba): can we destroy and clean up the ev_dev now?
     host_gamepad->state = kStateActivated;
   } else {
-    fprintf(stderr,
-            "error: libevdev_uinput_create_from_device failed with error %d\n",
-            err);
+    LOG(ERROR) << "libevdev_uinput_create_from_device failed with error "
+               << err;
     host_gamepad->state = kStateError;
   }
 }
@@ -634,7 +627,7 @@ static void sl_internal_gaming_seat_gamepad_added_with_device_info(
   host_gamepad->input_mapping = nullptr;
 
   if (host_gamepad->ev_dev == nullptr) {
-    fprintf(stderr, "error: libevdev_new failed\n");
+    LOG(ERROR) << "libevdev_new failed";
     host_gamepad->state = kStateError;
     return;
   }
@@ -669,14 +662,8 @@ static void sl_internal_gaming_seat_gamepad_added_with_device_info(
   for (unsigned int i = 0; i < ARRAY_SIZE(kButtons); i++)
     Libevdev::Get()->enable_event_code(host_gamepad->ev_dev, EV_KEY,
                                        kButtons[i], nullptr);
-  fprintf(
-      stderr,
-      "info: Gamepad added: name=%s, bus=%u, vendor_id=%x, product_id=%x, "
-      "version=%x, input_mapping=%s \n",
-      host_gamepad->name, host_gamepad->bus, host_gamepad->vendor_id,
-      host_gamepad->product_id, host_gamepad->version,
-      (host_gamepad->input_mapping) ? host_gamepad->input_mapping->id : "none");
-}  // NOLINT(whitespace/indent), lint bug b/173143790
+  LOG(INFO) << "Gamepad added: " << host_gamepad;
+}
 
 // Note: not currently implemented by Exo.
 static void sl_internal_gaming_seat_gamepad_added(
@@ -684,8 +671,7 @@ static void sl_internal_gaming_seat_gamepad_added(
     struct zcr_gaming_seat_v2* gaming_seat,
     struct zcr_gamepad_v2* gamepad) {
   TRACE_EVENT("gaming", "sl_internal_gaming_seat_gamepad_added");
-  fprintf(stderr,
-          "error: sl_internal_gaming_seat_gamepad_added unimplemented\n");
+  LOG(ERROR) << "sl_internal_gaming_seat_gamepad_added unimplemented";
 }
 
 static const struct zcr_gaming_seat_v2_listener

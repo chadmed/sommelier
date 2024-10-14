@@ -71,7 +71,7 @@ static void sl_host_pointer_set_cursor(struct wl_client* client,
 
   wl_pointer_set_cursor(host->proxy, serial,
                         host_surface ? host_surface->proxy : nullptr, hsx, hsy);
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_host_pointer_release(struct wl_client* client,
                                     struct wl_resource* resource) {
@@ -146,7 +146,7 @@ static void sl_pointer_enter(void* data,
   if (host->focus_resource)
     sl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_pointer_leave(void* data,
                              struct wl_pointer* pointer,
@@ -169,8 +169,7 @@ static void sl_pointer_motion(void* data,
   wl_fixed_t mx = x;
   wl_fixed_t my = y;
 
-  sl_transform_host_to_guest_fixed(host->seat->ctx, host->focus_surface, &mx,
-                                   &my);
+  sl_transform_pointer(host->seat->ctx, host->focus_surface, &mx, &my);
   wl_pointer_send_motion(host->resource, time, mx, my);
 }
 
@@ -370,7 +369,7 @@ static void sl_keyboard_enter(void* data,
   sl_keyboard_set_focus(host, serial, host_surface, keys);
 
   host->seat->last_serial = serial;
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_keyboard_leave(void* data,
                               struct wl_keyboard* keyboard,
@@ -429,13 +428,12 @@ static void sl_keyboard_key(void* data,
       uint32_t num_symbols;
       xkb_keysym_t symbol = XKB_KEY_NoSymbol;
       uint32_t code = key + 8;
-      struct sl_accelerator* accelerator;
 
       num_symbols = xkb_state_key_get_syms(host->state, code, &symbols);
       if (num_symbols == 1)
         symbol = symbols[0];
 
-      wl_list_for_each(accelerator, &host->seat->ctx->accelerators, link) {
+      for (auto accelerator : host->seat->ctx->accelerators) {
         if (host->modifiers == accelerator->modifiers &&
             xkb_keysym_to_lower(symbol) == accelerator->symbol) {
           handled = false;
@@ -445,8 +443,7 @@ static void sl_keyboard_key(void* data,
       if (host->seat->ctx->host_focus_window &&
           !(host->seat->ctx->host_focus_window->fullscreen ||
             host->seat->ctx->host_focus_window->compositor_fullscreen)) {
-        wl_list_for_each(accelerator, &host->seat->ctx->windowed_accelerators,
-                         link) {
+        for (auto accelerator : host->seat->ctx->accelerators) {
           if (host->modifiers == accelerator->modifiers &&
               xkb_keysym_to_lower(symbol) == accelerator->symbol) {
             handled = false;
@@ -579,7 +576,7 @@ static void sl_host_touch_down(void* data,
   if (host->focus_resource)
     sl_set_last_event_serial(host->focus_resource, serial);
   host->seat->last_serial = serial;
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_host_touch_up(void* data,
                              struct wl_touch* touch,

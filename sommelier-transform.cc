@@ -91,11 +91,7 @@ static void sl_transform_direct_to_guest_fixed(struct sl_context* ctx,
                                                uint32_t axis) {
   double scale = sl_transform_direct_axis_scale(ctx, surface, axis);
   double result = wl_fixed_to_double(*coord);
-  if (ctx->stable_scaling) {
-    stable_scale_host_to_guest(&result, scale);
-  } else {
-    result *= scale;
-  }
+  result *= scale;
 
   *coord = wl_fixed_from_double(result);
 }
@@ -110,18 +106,11 @@ static void sl_transform_direct_to_guest_fixed(struct sl_context* ctx,
 
   sl_transform_get_scale_factors(ctx, surface, &scale_x, &scale_y);
 
-  if (ctx->stable_scaling) {
-    stable_scale_host_to_guest(&result_x, scale_x);
-    stable_scale_host_to_guest(&result_y, scale_y);
-    *x = wl_fixed_from_double(result_x);
-    *y = wl_fixed_from_double(result_y);
-  } else {
-    result_x *= scale_x;
-    result_y *= scale_y;
+  result_x *= scale_x;
+  result_y *= scale_y;
 
-    *x = wl_fixed_from_double(result_x);
-    *y = wl_fixed_from_double(result_y);
-  }
+  *x = wl_fixed_from_double(result_x);
+  *y = wl_fixed_from_double(result_y);
 }
 
 static void sl_transform_direct_to_host_fixed(struct sl_context* ctx,
@@ -131,11 +120,7 @@ static void sl_transform_direct_to_host_fixed(struct sl_context* ctx,
   double scale = sl_transform_direct_axis_scale(ctx, surface, axis);
   double result = wl_fixed_to_double(*coord);
 
-  if (ctx->stable_scaling) {
-    stable_scale_guest_to_host(&result, scale);
-  } else {
-    result /= scale;
-  }
+  result /= scale;
 
   *coord = wl_fixed_from_double(result);
 }
@@ -151,13 +136,8 @@ static void sl_transform_direct_to_host_fixed(struct sl_context* ctx,
   double result_x = wl_fixed_to_double(*x);
   double result_y = wl_fixed_to_double(*y);
 
-  if (ctx->stable_scaling) {
-    stable_scale_guest_to_host(&result_x, scale_x);
-    stable_scale_guest_to_host(&result_y, scale_y);
-  } else {
-    result_x /= scale_x;
-    result_y /= scale_y;
-  }
+  result_x /= scale_x;
+  result_y /= scale_y;
 
   *x = wl_fixed_from_double(result_x);
   *y = wl_fixed_from_double(result_y);
@@ -220,7 +200,10 @@ bool sl_transform_viewport_scale(struct sl_context* ctx,
   // when the virtual and logical space match.
   bool do_viewport = true;
 
-  if (ctx->use_direct_scale) {
+  if (surface && surface->window && surface->window->viewport_override) {
+    *width = surface->window->viewport_width;
+    *height = surface->window->viewport_height;
+  } else if (ctx->use_direct_scale) {
     sl_transform_direct_to_host(ctx, surface, width, height);
 
     // For very small windows (in pixels), the resulting logical dimensions
@@ -306,14 +289,24 @@ void sl_transform_host_to_guest_fixed(struct sl_context* ctx,
     double dx = wl_fixed_to_double(*x);
     double dy = wl_fixed_to_double(*y);
 
-    if (ctx->stable_scaling) {
-      stable_scale_host_to_guest(&dx, ctx->scale);
-      stable_scale_host_to_guest(&dy, ctx->scale);
-    } else {
-      dx *= ctx->scale;
-      dy *= ctx->scale;
-    }
+    dx *= ctx->scale;
+    dy *= ctx->scale;
 
+    *x = wl_fixed_from_double(dx);
+    *y = wl_fixed_from_double(dy);
+  }
+}
+
+void sl_transform_pointer(struct sl_context* ctx,
+                          struct sl_host_surface* surface,
+                          wl_fixed_t* x,
+                          wl_fixed_t* y) {
+  sl_transform_host_to_guest_fixed(ctx, surface, x, y);
+  if (surface && surface->window && surface->window->viewport_override) {
+    double dx = wl_fixed_to_double(*x);
+    double dy = wl_fixed_to_double(*y);
+    dx *= surface->window->viewport_pointer_scale;
+    dy *= surface->window->viewport_pointer_scale;
     *x = wl_fixed_from_double(dx);
     *y = wl_fixed_from_double(dy);
   }
@@ -327,11 +320,7 @@ void sl_transform_host_to_guest_fixed(struct sl_context* ctx,
     sl_transform_direct_to_guest_fixed(ctx, surface, coord, axis);
   } else {
     double dx = wl_fixed_to_double(*coord);
-    if (ctx->stable_scaling) {
-      stable_scale_host_to_guest(&dx, ctx->scale);
-    } else {
-      dx *= ctx->scale;
-    }
+    dx *= ctx->scale;
     *coord = wl_fixed_from_double(dx);
   }
 }
@@ -363,13 +352,8 @@ void sl_transform_guest_to_host_fixed(struct sl_context* ctx,
     double dx = wl_fixed_to_double(*x);
     double dy = wl_fixed_to_double(*y);
 
-    if (ctx->stable_scaling) {
-      stable_scale_guest_to_host(&dx, ctx->scale);
-      stable_scale_guest_to_host(&dy, ctx->scale);
-    } else {
-      dx /= ctx->scale;
-      dy /= ctx->scale;
-    }
+    dx /= ctx->scale;
+    dy /= ctx->scale;
 
     *x = wl_fixed_from_double(dx);
     *y = wl_fixed_from_double(dy);
@@ -384,12 +368,7 @@ void sl_transform_guest_to_host_fixed(struct sl_context* ctx,
     sl_transform_direct_to_host_fixed(ctx, surface, coord, axis);
   } else {
     double dx = wl_fixed_to_double(*coord);
-
-    if (ctx->stable_scaling) {
-      stable_scale_guest_to_host(&dx, ctx->scale);
-    } else {
-      dx /= ctx->scale;
-    }
+    dx /= ctx->scale;
     *coord = wl_fixed_from_double(dx);
   }
 }
@@ -401,7 +380,6 @@ struct sl_host_output* sl_transform_guest_position_to_host_position(
 
   // Translate from global to output-relative guest coordinates
   (*x) -= output->virt_x;
-  (*y) -= output->virt_y;
 
   // Convert to host logical scale
   sl_transform_guest_to_host(ctx, surface, x, y);
@@ -427,7 +405,6 @@ struct sl_host_output* sl_transform_host_position_to_guest_position(
 
   // Translate to global guest coordinates
   (*x) += output->virt_x;
-  (*y) += output->virt_y;
 
   return output;
 }

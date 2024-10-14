@@ -5,10 +5,13 @@
 #ifndef VM_TOOLS_SOMMELIER_TESTING_X11_TEST_BASE_H_
 #define VM_TOOLS_SOMMELIER_TESTING_X11_TEST_BASE_H_
 
+#include <xcb/xproto.h>
 #include <memory>
+#include <string>
 
 #include "../xcb/mock-xcb-shim.h"
-#include "wayland-test-base.h"  // NOLINT(build/include_directory)
+#include "mock-viewporter-shim.h"  // NOLINT(build/include_directory)
+#include "wayland-test-base.h"     // NOLINT(build/include_directory)
 
 namespace vm_tools {
 namespace sommelier {
@@ -19,6 +22,10 @@ class X11TestBase : public WaylandTestBase {
   void InitContext() override {
     WaylandTestBase::InitContext();
     ctx.xwayland = 1;
+
+    // Always delegate ID generation to the fake XCB shim, even for test cases
+    // that never use the fake for anything else. This prevents ID collisions.
+    xcb.DelegateIdGenerationToFake();
 
     // Create a fake screen with somewhat plausible values.
     // Some of these are not realistic because they refer to things not present
@@ -44,6 +51,7 @@ class X11TestBase : public WaylandTestBase {
 
   void Connect() override {
     set_xcb_shim(&xcb);
+    set_wp_viewport_shim(&mock_viewport_shim_);
     WaylandTestBase::Connect();
 
     // Pretend Xwayland has connected to Sommelier as a Wayland client.
@@ -56,13 +64,8 @@ class X11TestBase : public WaylandTestBase {
 
   ~X11TestBase() override { set_xcb_shim(nullptr); }
 
-  uint32_t GenerateId() {
-    static uint32_t id = 0;
-    return ++id;
-  }
-
   virtual sl_window* CreateWindowWithoutRole() {
-    xcb_window_t window_id = GenerateId();
+    xcb_window_t window_id = xcb.generate_id(ctx.connection);
     sl_create_window(&ctx, window_id, 0, 0, 800, 600, 0);
     sl_window* window = sl_lookup_window(&ctx, window_id);
     EXPECT_NE(window, nullptr);
@@ -73,7 +76,7 @@ class X11TestBase : public WaylandTestBase {
     sl_window* window = CreateWindowWithoutRole();
 
     // Pretend we created a frame window too
-    window->frame_id = GenerateId();
+    window->frame_id = xcb.generate_id(ctx.connection);
 
     window->host_surface_id = SurfaceId(xwayland->CreateSurface());
     sl_window_update(window);
@@ -89,9 +92,33 @@ class X11TestBase : public WaylandTestBase {
     return window;
   }
 
+  std::string StringPropertyForTesting(xcb_window_t window_id,
+                                       xcb_atom_t property_name) {
+    xcb_get_property_cookie_t cookie = xcb.get_property(
+        nullptr, 0, window_id, property_name, XCB_ATOM_STRING, 0, 1024);
+    xcb_get_property_reply_t* reply =
+        xcb.get_property_reply(nullptr, cookie, nullptr);
+    EXPECT_TRUE(reply) << "get_property_reply() returned null. Try calling "
+                          "xcb.DelegateToFake().";
+    std::string result;
+    if (reply->format != 8) {
+      result = "error: expected X11 property format 8, got " +
+               std::to_string(reply->format);
+    } else if (reply->type != XCB_ATOM_STRING) {
+      result = "error: expected X11 property type XCB_ATOM_STRING";
+    } else {
+      void* value = xcb.get_property_value(reply);
+      result = std::string(static_cast<char*>(value), reply->length);
+      free(value);
+    }
+    free(reply);
+    return result;
+  }
+
  protected:
   NiceMock<MockXcbShim> xcb;
   std::unique_ptr<FakeWaylandClient> xwayland;
+  NiceMock<MockWpViewportShim> mock_viewport_shim_;
 };
 
 // Fixture for unit tests which use direct scale.

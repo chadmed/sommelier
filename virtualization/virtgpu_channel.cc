@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "../sommelier-logging.h"           // NOLINT(build/include_directory)
 #include "linux-headers/virtgpu_drm.h"      // NOLINT(build/include_directory)
 #include "virtgpu_cross_domain_protocol.h"  // NOLINT(build/include_directory)
 #include "wayland_channel.h"                // NOLINT(build/include_directory)
@@ -47,8 +48,10 @@ struct virtgpu_param {
   uint32_t value;
 };
 
-#define PARAM(x) \
-  (struct virtgpu_param) { x, #x, 0 }
+#define PARAM(x)           \
+  (struct virtgpu_param) { \
+    x, #x, 0               \
+  }
 
 int open_virtgpu(char** drm_device) {
   int fd;
@@ -99,13 +102,13 @@ int32_t fstat_pipe(int fd, uint32_t& inode) {
   ret = fstat(fd, &statbuf);
 
   if (ret) {
-    fprintf(stderr, "fstat failed\n");
+    LOG(ERROR) << "fstat failed: " << strerror(errno);
     return ret;
   }
 
   // fstat + S_ISFIFO(..) will return true for both anonymous and named pipes.
   if (!S_ISFIFO(statbuf.st_mode)) {
-    fprintf(stderr, "expected anonymous pipe\n");
+    LOG(ERROR) << "expected anonymous pipe";
     return -EINVAL;
   }
 
@@ -141,7 +144,7 @@ int32_t VirtGpuChannel::init() {
 
   virtgpu_ = open_virtgpu(&drm_device);
   if (virtgpu_ < 0) {
-    fprintf(stderr, "failed to open virtgpu\n");
+    LOG(ERROR) << "failed to open virtgpu: " << strerror(errno);
     return -errno;
   }
 
@@ -164,8 +167,8 @@ int32_t VirtGpuChannel::init() {
     get_param.value = (uint64_t)(uintptr_t)&param.value;
     ret = drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_GETPARAM, &get_param);
     if (ret < 0) {
-      fprintf(stderr, "DRM_IOCTL_VIRTGPU_GET_PARAM failed with %s\n",
-              strerror(errno));
+      LOG(ERROR) << "DRM_IOCTL_VIRTGPU_GET_PARAM failed with "
+                 << strerror(errno);
       close(virtgpu_);
       virtgpu_ = -1;
       return -EINVAL;
@@ -183,8 +186,7 @@ int32_t VirtGpuChannel::init() {
 
   ret = drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_GET_CAPS, &args);
   if (ret) {
-    fprintf(stderr, "DRM_IOCTL_VIRTGPU_GET_CAPS failed with %s\n",
-            strerror(errno));
+    LOG(ERROR) << "DRM_IOCTL_VIRTGPU_GET_CAPS failed with " << strerror(errno);
     return ret;
   }
 
@@ -195,7 +197,7 @@ int32_t VirtGpuChannel::init() {
                      (1 << CROSS_DOMAIN_CHANNEL_TYPE_WAYLAND);
 
   if (!supports_wayland) {
-    fprintf(stderr, "Wayland support not present on host.\n");
+    LOG(ERROR) << "Wayland support not present on host";
     return -ENOTSUP;
   }
 
@@ -220,8 +222,8 @@ int32_t VirtGpuChannel::create_ring(uint32_t& out_handle,
   ret =
       drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &drm_rc_blob);
   if (ret < 0) {
-    fprintf(stderr, "DRM_VIRTGPU_RESOURCE_CREATE_BLOB failed with %s\n",
-            strerror(errno));
+    LOG(ERROR) << "DRM_VIRTGPU_RESOURCE_CREATE_BLOB failed with "
+               << strerror(errno);
     return ret;
   }
 
@@ -232,7 +234,7 @@ int32_t VirtGpuChannel::create_ring(uint32_t& out_handle,
   map.handle = out_handle;
   ret = drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_MAP, &map);
   if (ret < 0) {
-    fprintf(stderr, "DRM_IOCTL_VIRTGPU_MAP failed with %s\n", strerror(errno));
+    LOG(ERROR) << "DRM_IOCTL_VIRTGPU_MAP failed with " << strerror(errno);
     return ret;
   }
 
@@ -240,7 +242,7 @@ int32_t VirtGpuChannel::create_ring(uint32_t& out_handle,
                   virtgpu_, map.offset);
 
   if (out_addr == MAP_FAILED) {
-    fprintf(stderr, "mmap failed with %s\n", strerror(errno));
+    LOG(ERROR) << "mmap failed with " << strerror(errno);
     return ret;
   }
 
@@ -269,8 +271,8 @@ int32_t VirtGpuChannel::create_context(int& out_channel_fd) {
   init.num_params = 3;
   ret = drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_CONTEXT_INIT, &init);
   if (ret) {
-    fprintf(stderr, "DRM_IOCTL_VIRTGPU_CONTEXT_INIT failed with %s\n",
-            strerror(errno));
+    LOG(ERROR) << "DRM_IOCTL_VIRTGPU_CONTEXT_INIT failed with "
+               << strerror(errno);
     return ret;
   }
 
@@ -291,8 +293,8 @@ int32_t VirtGpuChannel::create_context(int& out_channel_fd) {
   cmd_init.query_ring_id = query_ring_res_id;
   cmd_init.channel_ring_id = channel_ring_res_id;
   cmd_init.channel_type = CROSS_DOMAIN_CHANNEL_TYPE_WAYLAND;
-  ret = submit_cmd((uint32_t*)&cmd_init, cmd_init.hdr.cmd_size,
-                   CROSS_DOMAIN_RING_NONE, 0, false);
+  ret = submit_cmd(reinterpret_cast<uint32_t*>(&cmd_init),
+                   cmd_init.hdr.cmd_size, CROSS_DOMAIN_RING_NONE, 0, false);
   if (ret < 0)
     return ret;
 
@@ -351,8 +353,8 @@ int32_t VirtGpuChannel::send(const struct WaylandSendReceive& send) {
     cmd_send->num_identifiers++;
   }
 
-  ret = submit_cmd((uint32_t*)cmd_send, cmd_send->hdr.cmd_size,
-                   CROSS_DOMAIN_RING_NONE, 0, false);
+  ret = submit_cmd(reinterpret_cast<uint32_t*>(cmd_send),
+                   cmd_send->hdr.cmd_size, CROSS_DOMAIN_RING_NONE, 0, false);
   if (ret < 0)
     return ret;
 
@@ -370,13 +372,13 @@ int32_t VirtGpuChannel::handle_channel_event(
   struct drm_event dummy_event;
 
   bytes_read = read(virtgpu_, &dummy_event, sizeof(struct drm_event));
-  if (bytes_read < (int)sizeof(struct drm_event)) {
-    fprintf(stderr, "invalid event size\n");
+  if (bytes_read < static_cast<int>(sizeof(struct drm_event))) {
+    LOG(ERROR) << "invalid event size";
     return -EINVAL;
   }
 
   if (dummy_event.type != VIRTGPU_EVENT_FENCE_SIGNALED) {
-    fprintf(stderr, "invalid event type\n");
+    LOG(ERROR) << "invalid event type";
     return -EINVAL;
   }
 
@@ -410,7 +412,7 @@ int32_t VirtGpuChannel::allocate(
 
   ret = image_query(create_info, create_output, blob_id);
   if (ret < 0) {
-    fprintf(stderr, "image query failed\n");
+    LOG(ERROR) << "image query failed";
     return ret;
   }
 
@@ -464,8 +466,8 @@ int32_t VirtGpuChannel::handle_pipe(int read_fd, bool readable, bool& hang_up) {
       sizeof(struct CrossDomainReadWrite) + cmd_write->opaque_data_size;
   cmd_write->hang_up = hang_up;
 
-  ret = submit_cmd((uint32_t*)cmd_write, cmd_write->hdr.cmd_size,
-                   CROSS_DOMAIN_RING_NONE, 0, false);
+  ret = submit_cmd(reinterpret_cast<uint32_t*>(cmd_write),
+                   cmd_write->hdr.cmd_size, CROSS_DOMAIN_RING_NONE, 0, false);
   if (ret < 0)
     return ret;
 
@@ -501,8 +503,8 @@ int32_t VirtGpuChannel::submit_cmd(uint32_t* cmd,
 
   ret = drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_EXECBUFFER, &exec);
   if (ret < 0) {
-    fprintf(stderr, "DRM_IOCTL_VIRTGPU_EXECBUFFER failed with %s\n",
-            strerror(errno));
+    LOG(ERROR) << "DRM_IOCTL_VIRTGPU_EXECBUFFER failed with "
+               << strerror(errno);
     return -EINVAL;
   }
 
@@ -521,7 +523,7 @@ int32_t VirtGpuChannel::submit_cmd(uint32_t* cmd,
   }
 
   if (ret < 0) {
-    fprintf(stderr, "DRM_IOCTL_VIRTGPU_WAIT failed with %s\n", strerror(errno));
+    LOG(ERROR) << "DRM_IOCTL_VIRTGPU_WAIT failed with " << strerror(errno);
     return ret;
   }
 
@@ -532,7 +534,7 @@ int32_t VirtGpuChannel::image_query(const struct WaylandBufferCreateInfo& input,
                                     struct WaylandBufferCreateOutput& output,
                                     uint64_t& blob_id) {
   int32_t ret = 0;
-  uint32_t* addr = (uint32_t*)query_ring_addr_;
+  uint32_t* addr = reinterpret_cast<uint32_t*>(query_ring_addr_);
   struct CrossDomainGetImageRequirements cmd_get_reqs = {};
   struct BufferDescription new_desc = {};
 
@@ -556,8 +558,9 @@ int32_t VirtGpuChannel::image_query(const struct WaylandBufferCreateInfo& input,
   // Assumes a gbm-like API on the host
   cmd_get_reqs.flags = GBM_BO_USE_LINEAR | GBM_BO_USE_SCANOUT;
 
-  ret = submit_cmd((uint32_t*)&cmd_get_reqs, cmd_get_reqs.hdr.cmd_size,
-                   CROSS_DOMAIN_QUERY_RING, query_ring_handle_, true);
+  ret = submit_cmd(reinterpret_cast<uint32_t*>(&cmd_get_reqs),
+                   cmd_get_reqs.hdr.cmd_size, CROSS_DOMAIN_QUERY_RING,
+                   query_ring_handle_, true);
   if (ret < 0)
     return ret;
 
@@ -571,7 +574,7 @@ int32_t VirtGpuChannel::image_query(const struct WaylandBufferCreateInfo& input,
   // Sanity check
   if (!input.dmabuf) {
     if (new_desc.output.host_size < input.size) {
-      fprintf(stderr, "invalid host size\n");
+      LOG(ERROR) << "invalid host size";
       return -EINVAL;
     }
   }
@@ -592,8 +595,8 @@ int32_t VirtGpuChannel::close_gem_handle(uint32_t gem_handle) {
   gem_close.handle = gem_handle;
   ret = drmIoctl(virtgpu_, DRM_IOCTL_GEM_CLOSE, &gem_close);
   if (ret) {
-    fprintf(stderr, "DRM_IOCTL_GEM_CLOSE failed (handle=%x) error %s\n",
-            gem_handle, strerror(errno));
+    LOG(ERROR) << "DRM_IOCTL_GEM_CLOSE failed (handle=" << std::hex
+               << gem_handle << ") error " << strerror(errno);
     return -errno;
   }
 
@@ -609,8 +612,8 @@ int32_t VirtGpuChannel::channel_poll() {
 
   // Specifying `channel_ring_handle_` is unnecessary.  The waiting mechanism
   // is `VIRTGPU_CONTEXT_PARAM_POLL_RINGS_MASK` for channel responses.
-  ret = submit_cmd((uint32_t*)&cmd_poll, cmd_poll.hdr.cmd_size,
-                   CROSS_DOMAIN_CHANNEL_RING, 0, false);
+  ret = submit_cmd(reinterpret_cast<uint32_t*>(&cmd_poll),
+                   cmd_poll.hdr.cmd_size, CROSS_DOMAIN_CHANNEL_RING, 0, false);
   if (ret < 0)
     return ret;
 
@@ -632,16 +635,15 @@ int32_t VirtGpuChannel::create_host_blob(uint64_t blob_id,
   ret =
       drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB, &drm_rc_blob);
   if (ret < 0) {
-    fprintf(stderr, "DRM_VIRTGPU_RESOURCE_CREATE_BLOB failed with %s\n",
-            strerror(errno));
+    LOG(ERROR) << "DRM_VIRTGPU_RESOURCE_CREATE_BLOB failed with "
+               << strerror(errno);
     return -errno;
   }
 
   ret = drmPrimeHandleToFD(virtgpu_, drm_rc_blob.bo_handle,
                            DRM_CLOEXEC | DRM_RDWR, &out_fd);
   if (ret < 0) {
-    fprintf(stderr, "drmPrimeHandleToFD failed with with %s\n",
-            strerror(errno));
+    LOG(ERROR) << "drmPrimeHandleToFD failed with with " << strerror(errno);
     return -errno;
   }
 
@@ -680,7 +682,7 @@ int32_t VirtGpuChannel::fd_analysis(int fd,
     ret = drmIoctl(virtgpu_, DRM_IOCTL_VIRTGPU_RESOURCE_INFO, &drm_res_info);
 
     if (ret) {
-      fprintf(stderr, "resource info failed\n");
+      LOG(ERROR) << "resource info failed";
       return ret;
     }
 
@@ -726,7 +728,7 @@ int32_t VirtGpuChannel::create_pipe_internal(int& out_pipe_fd,
 
   ret = pipe(fds);
   if (ret < 0) {
-    fprintf(stderr, "pipe creation failed with %s\n", strerror(errno));
+    LOG(ERROR) << "pipe creation failed with " << strerror(errno);
     return -errno;
   }
 
@@ -756,8 +758,8 @@ int32_t VirtGpuChannel::handle_receive(enum WaylandChannelEvent& event_type,
   struct CrossDomainSendReceive* cmd_receive =
       (struct CrossDomainSendReceive*)channel_ring_addr_;
 
-  uint8_t* recv_data =
-      (uint8_t*)channel_ring_addr_ + sizeof(struct CrossDomainSendReceive);
+  uint8_t* recv_data = reinterpret_cast<uint8_t*>(channel_ring_addr_) +
+                       sizeof(struct CrossDomainSendReceive);
 
   for (uint32_t i = 0; i < CROSS_DOMAIN_MAX_IDENTIFIERS; i++) {
     if (i < cmd_receive->num_identifiers) {
@@ -808,8 +810,8 @@ int32_t VirtGpuChannel::handle_read() {
   struct CrossDomainReadWrite* cmd_read =
       (struct CrossDomainReadWrite*)channel_ring_addr_;
 
-  uint8_t* read_data =
-      (uint8_t*)channel_ring_addr_ + sizeof(struct CrossDomainReadWrite);
+  uint8_t* read_data = reinterpret_cast<uint8_t*>(channel_ring_addr_) +
+                       sizeof(struct CrossDomainReadWrite);
 
   ret = pipe_lookup(CROSS_DOMAIN_ID_TYPE_READ_PIPE, cmd_read->identifier,
                     write_fd, index);
@@ -819,7 +821,7 @@ int32_t VirtGpuChannel::handle_read() {
   bytes_written = write(write_fd, read_data, cmd_read->opaque_data_size);
 
   if (bytes_written < (ssize_t)cmd_read->opaque_data_size) {
-    fprintf(stderr, "failed to write all necessary bytes\n");
+    LOG(ERROR) << "failed to write all necessary bytes";
     return -EINVAL;
   }
 

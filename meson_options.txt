@@ -46,14 +46,20 @@ option('commit_loop_fix',
   description: 'enable a fix to the commit-cycle, which is known to break some apps'
 )
 
-option('black_screen_fix',
+option('quirks',
   type: 'boolean',
   value: false,
-  description: 'enable a fix to fix some apps blackscreening when losing focus'
+  description: 'support "quirks mode" config files'
 )
 
 option('with_tests',
   type: 'boolean',
   value: true,
   description: 'build the sommelier_test target'
+)
+
+option('log_level',
+  type: 'integer',
+  value: 0,
+  description: 'log level to print, -1 prints everything, default is 0 (up to INFO)'
 )

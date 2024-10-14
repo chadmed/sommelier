@@ -3,6 +3,7 @@
 // found in the LICENSE file.
 
 #include "sommelier.h"            // NOLINT(build/include_directory)
+#include "sommelier-logging.h"    // NOLINT(build/include_directory)
 #include "sommelier-transform.h"  // NOLINT(build/include_directory)
 
 #include <assert.h>
@@ -48,6 +49,11 @@ struct sl_data_transfer {
   size_t offset;
   size_t bytes_left;
   uint8_t data[DEFAULT_BUFFER_SIZE];
+  // Flag to temporarily track if we've just finished writing. This is used to
+  // ignore the first WL_EVENT_HANGUP after a write since we seem to spuriously
+  // get WL_EVENT_HANGUP when the socket isn't closed and can still be used
+  // after a write.
+  bool written;
   std::unique_ptr<struct wl_event_source> read_event_source;
   std::unique_ptr<struct wl_event_source> write_event_source;
 };
@@ -81,8 +87,10 @@ static int sl_handle_data_transfer_read(int fd, uint32_t mask, void* data) {
 
     // In the case of an error, where there is not likely to be any more data to
     // read, we still want to wait for any data we did get to be written out.
-    if (!transfer->bytes_left) {
+    if (!transfer->bytes_left && !transfer->written) {
       sl_data_transfer_destroy(transfer);
+    } else if (transfer->written) {
+      transfer->written = false;
     }
     return 0;
   }
@@ -96,6 +104,7 @@ static int sl_handle_data_transfer_read(int fd, uint32_t mask, void* data) {
     transfer->offset = 0;
     // There may still be data to read from the event source, but we have no
     // room in our buffer so move to the writing state.
+    transfer->written = false;
     wl_event_source_fd_update(transfer->read_event_source.get(), 0);
     wl_event_source_fd_update(transfer->write_event_source.get(),
                               WL_EVENT_WRITABLE);
@@ -137,6 +146,7 @@ static int sl_handle_data_transfer_write(int fd, uint32_t mask, void* data) {
 
   if (!transfer->bytes_left) {
     // If all data has been written, move back to the reading state.
+    transfer->written = true;
     wl_event_source_fd_update(transfer->write_event_source.get(), 0);
     wl_event_source_fd_update(transfer->read_event_source.get(),
                               WL_EVENT_READABLE);
@@ -164,6 +174,7 @@ static void sl_data_transfer_create(struct wl_event_loop* event_loop,
   transfer->write_fd = write_fd;
   transfer->offset = 0;
   transfer->bytes_left = 0;
+  transfer->written = false;
   memset(transfer->data, 0, DEFAULT_BUFFER_SIZE);
   transfer->read_event_source.reset(
       wl_event_loop_add_fd(event_loop, read_fd, WL_EVENT_READABLE,
@@ -189,7 +200,7 @@ static void sl_data_offer_receive(struct wl_client* client,
   int pipe_fd, rv;
   rv = host->ctx->channel->create_pipe(pipe_fd);
   if (rv) {
-    fprintf(stderr, "error: failed to create virtwl pipe: %s\n", strerror(-rv));
+    LOG(ERROR) << "failed to create virtwl pipe: " << strerror(-rv);
     close(fd);
     return;
   }
@@ -351,12 +362,12 @@ static void sl_data_device_start_drag(struct wl_client* client,
                             host_source ? host_source->proxy : nullptr,
                             host_origin ? host_origin->proxy : nullptr,
                             host_icon ? host_icon->proxy : nullptr, serial);
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_data_device_release(struct wl_client* client,
                                    struct wl_resource* resource) {
   wl_resource_destroy(resource);
-}  // NOLINT(whitespace/indent)
+}
 
 static const struct wl_data_device_interface sl_data_device_implementation = {
     sl_data_device_start_drag,
@@ -405,7 +416,7 @@ static void sl_data_device_enter(void* data,
 
   wl_data_device_send_enter(host->resource, serial, host_surface->resource, ix,
                             iy, host_data_offer->resource);
-}  // NOLINT(whitespace/indent)
+}
 
 static void sl_data_device_leave(void* data,
                                  struct wl_data_device* data_device) {
@@ -512,7 +523,7 @@ static void sl_data_device_manager_get_data_device(
       wl_data_device_manager_get_data_device(host->proxy, host_seat->proxy);
   wl_data_device_add_listener(host_data_device->proxy, &sl_data_device_listener,
                               host_data_device);
-}  // NOLINT(whitespace/indent)
+}
 
 static const struct wl_data_device_manager_interface
     sl_data_device_manager_implementation = {

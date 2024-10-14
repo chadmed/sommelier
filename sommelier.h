@@ -15,14 +15,13 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "compositor/sommelier-mmap.h"  // NOLINT(build/include_directory)
-#include "sommelier-ctx.h"     // NOLINT(build/include_directory)
-#include "sommelier-global.h"  // NOLINT(build/include_directory)
-#include "sommelier-util.h"    // NOLINT(build/include_directory)
-#include "sommelier-window.h"  // NOLINT(build/include_directory)
-#include "weak-resource-ptr.h"  // NOLINT(build/include_directory)
+#include "sommelier-ctx.h"              // NOLINT(build/include_directory)
+#include "sommelier-global.h"           // NOLINT(build/include_directory)
+#include "sommelier-util.h"             // NOLINT(build/include_directory)
+#include "sommelier-window.h"           // NOLINT(build/include_directory)
+#include "weak-resource-ptr.h"          // NOLINT(build/include_directory)
 
 #define SOMMELIER_VERSION "0.20"
-#define XDG_SHELL_VERSION 3u
 #define APPLICATION_ID_FORMAT_PREFIX "org.chromium.guest_os.%s"
 #define NATIVE_WAYLAND_APPLICATION_ID_FORMAT \
   APPLICATION_ID_FORMAT_PREFIX ".wayland.%s"
@@ -53,6 +52,7 @@ struct sl_pointer_constraints;
 struct sl_window;
 struct sl_host_surface;
 struct sl_host_output;
+struct sl_fractional_scale_manager;
 struct zaura_shell;
 struct zcr_keyboard_extension_v1;
 struct zxdg_output_manager_v1;
@@ -137,6 +137,10 @@ struct sl_viewport {
   int32_t dst_height;
 };
 
+struct sl_fractional_scale {
+  struct wl_list link;
+};
+
 struct sl_host_callback {
   struct wl_resource* resource;
   struct wl_callback* proxy;
@@ -148,12 +152,16 @@ struct sl_host_surface {
   struct wl_surface* proxy;
   struct wp_viewport* viewport;
   struct wl_buffer* proxy_buffer;
+
+  // Window content size from XWayland: wl_surface.attach(passing a wl_buffer of
+  // size w', h').
   uint32_t contents_width;
   uint32_t contents_height;
   uint32_t contents_shm_format;
   int32_t contents_scale;
   int32_t contents_x_offset;
   int32_t contents_y_offset;
+
   double xdg_scale_x;
   double xdg_scale_y;
   bool scale_round_on_x;
@@ -172,6 +180,7 @@ struct sl_host_surface {
   struct zwp_linux_surface_synchronization_v1* surface_sync;
   struct wl_list released_buffers;
   struct wl_list busy_buffers;
+  struct sl_window* window = nullptr;
   WeakResourcePtr<sl_host_output> output;
 };
 MAP_STRUCTS(wl_surface, sl_host_surface);
@@ -237,6 +246,9 @@ struct sl_host_output {
   struct zxdg_output_v1* zxdg_output;
   struct zaura_output* aura_output;
   int internal;
+  // Whether or not this output has been modified and updated information needs
+  // to be forwarded.
+  bool needs_update;
 
   // Position in host's global logical space
   int x;
@@ -244,8 +256,9 @@ struct sl_host_output {
 
   int physical_width;
   int physical_height;
+
   // The physical width/height after being scaled by
-  // sl_output_get_dimensions_original.
+  // sl_output_get_dimensions_original to adjust the DPI values accordingly.
   int virt_physical_width;
   int virt_physical_height;
   int subpixel;
@@ -258,18 +271,40 @@ struct sl_host_output {
   // https://wayland.app/protocols/wayland#wl_output:event:mode
   int width;
   int height;
+
+  // The width/height after being scaled.
+  int virt_width;
+  int virt_height;
+
   // The width/height after being scaled by
   // sl_output_get_dimensions_original and rotated.
   int virt_rotated_width;
   int virt_rotated_height;
 
   int refresh;
+
+  // The output scale received from the host via wl_output.scale.
+  // When run without aura-shell and in non-direct-scale mode,
+  // we forward this scale to clients.
   int scale_factor;
+  // The current scale being used which is provided by zaura_output.scale.
   int current_scale;
+  // The preferred scale which is provided by zaura_output.scale. On a
+  // Chromebook, this is the "Default" value in Settings>Device>Display.
   int preferred_scale;
+  // The device_scale_factor provided by zaura_output.device_scale_factor.
+  // Chromebooks come with their own default device scale which is appropriate
+  // for their screen sizes.
   int device_scale_factor;
   int expecting_scale;
   bool expecting_logical_size;
+
+  // xdg_output values.
+  // Ref: https://wayland.app/protocols/xdg-output-unstable-v1
+  int32_t logical_width;
+  int32_t logical_height;
+  int32_t logical_x;
+  int32_t logical_y;
 
   // The scaling factors for direct mode
   // virt_scale: Used to translate from physical space to virtual space
@@ -288,11 +323,11 @@ struct sl_host_output {
   double xdg_scale_x;
   double xdg_scale_y;
   int virt_x;
+  // Note that all virtual screens are repositioned laterally in a row
+  // (regardless of host's positioning), which means y coordinate is always 0.
+  // However, in case future implementation changes, utilize this attribute
+  // whenever we reference virtual y coordinates.
   int virt_y;
-  int32_t logical_width;
-  int32_t logical_height;
-  int32_t logical_x;
-  int32_t logical_y;
 };
 MAP_STRUCTS(wl_output, sl_host_output);
 
@@ -304,7 +339,6 @@ struct sl_host_seat {
 MAP_STRUCTS(wl_seat, sl_host_seat);
 
 struct sl_accelerator {
-  struct wl_list link;
   uint32_t modifiers;
   xkb_keysym_t symbol;
 };
@@ -334,6 +368,7 @@ struct sl_text_input_manager {
   struct sl_context* ctx;
   uint32_t id;
   struct sl_global* host_global;
+  struct sl_global* host_crostini_manager_global;
   struct sl_global* host_x11_global;
 };
 
@@ -374,6 +409,7 @@ struct sl_viewporter {
 struct sl_xdg_shell {
   struct sl_context* ctx;
   uint32_t id;
+  uint32_t version;
   struct sl_global* host_global;
   struct xdg_wm_base* internal;
 };
@@ -386,18 +422,48 @@ struct sl_aura_shell {
   struct zaura_shell* internal;
 };
 
+/* Support for zwp_linux_dmabuf_v1 is expected of the server and advertised at
+ * the same version to clients (up to SL_LINUX_DMABUF_MAX_VERSION).
+ *
+ * When used directly by a client, each client request is passed through to the
+ * server (with some having additional internal behaviors). In such cases, the
+ * bound global is used to create proxies on-demand.
+ *
+ * There are additional internal uses for zwp_linux_dmabuf_v1:
+ *   - Emulating client wl_drm requests as zwp_linux_dmabuf_v1 requests to the
+ *     server. Each client-facing wl_drm resource instantiates its own
+ *     zwp_linux_dmabuf_v1 (version 2) server proxy to use internally.
+ *   - Creating host-sharable dmabufs (via the virtualization channel) as
+ *     "copy-on-commit" targets for client wl_shm buffers. A server-facing
+ *     zwp_linux_dmabuf_v1 (version 2) proxy is created to facilitate wl_buffer
+ *     creation from these dmabufs.
+ *   - Querying and converting the list of supported dmabuf formats to wl_shm
+ *     formats to send to a client upon wl_shm binding. Each client-facing
+ *     wl_shm resource instantiates its own zwp_linux_dmabuf_v1 (version 1)
+ *     proxy to use internally.
+ */
 struct sl_linux_dmabuf {
   struct sl_context* ctx;
   uint32_t id;
   uint32_t version;
   struct sl_global* host_drm_global;
-  struct zwp_linux_dmabuf_v1* internal;
+  struct sl_global* host_linux_dmabuf_global;
+
+  // binding (version 2) is only used for wl_shm copy-on-commit
+  struct zwp_linux_dmabuf_v1* proxy_v2;
 };
 
 struct sl_linux_explicit_synchronization {
   struct sl_context* ctx;
   uint32_t id;
   struct zwp_linux_explicit_synchronization_v1* internal;
+};
+
+struct sl_fractional_scale_manager {
+  struct sl_context* ctx;
+  uint32_t id;
+  struct sl_global* host_fractional_scale_manager_global;
+  struct wp_fractional_scale_manager_v1* internal;
 };
 
 struct sl_global {
@@ -425,6 +491,11 @@ struct sl_sync_point {
 };
 
 #ifdef GAMEPAD_SUPPORT
+struct InputMapping {
+  const char* id;
+  const std::unordered_map<uint32_t, uint32_t> mapping;
+};
+
 struct sl_host_gaming_seat {
   struct sl_host_gaming_seat* gaming_seat;
   struct wl_resource* resource;
@@ -446,6 +517,12 @@ struct sl_host_gamepad {
 };
 #endif
 
+struct sl_idle_inhibit_manager {
+  struct sl_context* ctx;
+  uint32_t id;
+  struct sl_global* host_global;
+};
+
 struct sl_host_buffer* sl_create_host_buffer(struct sl_context* ctx,
                                              struct wl_client* client,
                                              uint32_t id,
@@ -459,10 +536,6 @@ void sl_compositor_init_context(struct sl_context* ctx,
                                 struct wl_registry* registry,
                                 uint32_t id,
                                 uint32_t version);
-
-size_t sl_shm_bpp_for_shm_format(uint32_t format);
-
-size_t sl_shm_num_planes_for_shm_format(uint32_t format);
 
 struct sl_global* sl_shm_global_create(struct sl_context* ctx);
 
@@ -486,6 +559,13 @@ struct sl_host_output* sl_infer_output_for_host_position(struct sl_context* ctx,
 struct sl_host_output* sl_infer_output_for_guest_position(
     struct sl_context* ctx, int32_t virt_x, int32_t virt_y);
 
+// Generates all the virtual/modified values to be forwarded to the client.
+void sl_output_calculate_virtual_dimensions(struct sl_host_output* host);
+
+// Updates the virt_x of all outputs.
+void sl_output_update_output_x(struct sl_context* ctx);
+
+// Forwards all the available information of an output to the client.
 void sl_output_send_host_output_state(struct sl_host_output* host);
 
 struct sl_global* sl_output_global_create(struct sl_output* output);
@@ -499,11 +579,16 @@ struct sl_global* sl_data_device_manager_global_create(struct sl_context* ctx);
 
 struct sl_global* sl_viewporter_global_create(struct sl_context* ctx);
 
-struct sl_global* sl_xdg_shell_global_create(struct sl_context* ctx);
+struct sl_global* sl_xdg_shell_global_create(struct sl_context* ctx,
+                                             uint32_t version);
 
 struct sl_global* sl_gtk_shell_global_create(struct sl_context* ctx);
 
-struct sl_global* sl_drm_global_create(struct sl_context* ctx);
+struct sl_global* sl_drm_global_create(struct sl_context* ctx,
+                                       struct sl_linux_dmabuf* linux_dmabuf);
+
+struct sl_global* sl_linux_dmabuf_global_create(
+    struct sl_context* ctx, struct sl_linux_dmabuf* linux_dmabuf);
 
 struct sl_global* sl_text_input_extension_global_create(struct sl_context* ctx,
                                                         uint32_t exo_version);
@@ -512,8 +597,15 @@ struct sl_global* sl_text_input_manager_global_create(struct sl_context* ctx,
                                                       uint32_t exo_version);
 
 struct sl_global* sl_text_input_x11_global_create(struct sl_context* ctx);
+struct sl_global* sl_text_input_crostini_manager_global_create(
+    struct sl_context* ctx);
 
 struct sl_global* sl_pointer_constraints_global_create(struct sl_context* ctx);
+
+struct sl_global* sl_fractional_scale_manager_global_create(
+    struct sl_context* ctx);
+
+struct sl_global* sl_idle_inhibit_manager_global_create(struct sl_context* ctx);
 
 void sl_set_display_implementation(struct sl_context* ctx,
                                    struct wl_client* client);
@@ -555,8 +647,8 @@ void sl_handle_client_message(struct sl_context* ctx,
                               xcb_client_message_event_t* event);
 void sl_handle_focus_in(struct sl_context* ctx, xcb_focus_in_event_t* event);
 
-uint32_t sl_drm_format_for_shm_format(int format);
-int sl_shm_format_for_drm_format(uint32_t drm_format);
+void sl_host_surface_commit(struct wl_client* client,
+                            struct wl_resource* resource);
 
 #ifdef GAMEPAD_SUPPORT
 void sl_gaming_seat_add_listener(struct sl_context* ctx);

@@ -6,9 +6,12 @@
 
 #include "sommelier-ctx.h"        // NOLINT(build/include_directory)
 #include "sommelier-transform.h"  // NOLINT(build/include_directory)
+#include "testing/x11-test-base.h"
 
 namespace vm_tools {
 namespace sommelier {
+
+using TransformDirectScaleTest = X11DirectScaleTest;
 
 class TransformTest : public ::testing::Test {
  public:
@@ -264,8 +267,8 @@ TEST_F(TransformTest, HostToGuestFixed_ScaledWithoutDirectScale) {
 
   sl_transform_host_to_guest_fixed(&ctx, &fake_surface, &x, &y);
 
-  EXPECT_EQ(wl_fixed_to_double(x), 15.0);
-  EXPECT_EQ(wl_fixed_to_double(y), 15.0);
+  EXPECT_EQ(x, wl_fixed_from_double(16 * 0.9));
+  EXPECT_EQ(y, wl_fixed_from_double(16 * 0.9));
 }
 
 TEST_F(TransformTest, HostToGuestFixed_UnscaledWithDirectScale) {
@@ -294,8 +297,8 @@ TEST_F(TransformTest, HostToGuestFixed_ScaledWithDirectScale) {
 
   sl_transform_host_to_guest_fixed(&ctx, &fake_surface, &x, &y);
 
-  EXPECT_EQ(wl_fixed_to_double(x), 15.0);
-  EXPECT_EQ(wl_fixed_to_double(y), 26.0);
+  EXPECT_EQ(x, wl_fixed_from_double(0.9 * 16));
+  EXPECT_EQ(y, wl_fixed_from_double(1.6 * 16));
 }
 
 TEST_F(TransformTest, HostToGuestFixedCoord_UnscaledWithoutDirectScale) {
@@ -313,7 +316,7 @@ TEST_F(TransformTest, HostToGuestFixedCoord_ScaledWithoutDirectScale) {
 
   sl_transform_host_to_guest_fixed(&ctx, &fake_surface, &coord, 0u);
 
-  EXPECT_EQ(wl_fixed_to_double(coord), 15.0);
+  EXPECT_EQ(coord, wl_fixed_from_double(16 * 0.9));
 }
 
 TEST_F(TransformTest, HostToGuestFixedCoord_UnscaledWithDirectScale) {
@@ -337,7 +340,7 @@ TEST_F(TransformTest, HostToGuestFixedCoord_ScaledWithDirectScale) {
 
   sl_transform_host_to_guest_fixed(&ctx, &fake_surface, &coord, 0u);
 
-  EXPECT_EQ(wl_fixed_to_double(coord), 26);
+  EXPECT_EQ(coord, wl_fixed_from_double(1.6 * 16));
 }
 
 TEST_F(TransformTest, GuestToHost_UnscaledWithoutDirectScale) {
@@ -412,8 +415,8 @@ TEST_F(TransformTest, GuestToHostFixed_ScaledWithoutDirectScale) {
 
   sl_transform_guest_to_host_fixed(&ctx, &fake_surface, &x, &y);
 
-  EXPECT_EQ(wl_fixed_to_double(x), 16.0);
-  EXPECT_EQ(wl_fixed_to_double(y), 16.0);
+  EXPECT_EQ(x, wl_fixed_from_double(15 / 0.9));
+  EXPECT_EQ(y, wl_fixed_from_double(15 / 0.9));
 }
 
 TEST_F(TransformTest, GuestToHostFixed_UnscaledWithDirectScale) {
@@ -442,8 +445,8 @@ TEST_F(TransformTest, GuestToHostFixed_ScaledWithDirectScale) {
 
   sl_transform_guest_to_host_fixed(&ctx, &fake_surface, &x, &y);
 
-  EXPECT_EQ(wl_fixed_to_double(x), 16.0);
-  EXPECT_EQ(wl_fixed_to_double(y), 16.0);
+  EXPECT_EQ(x, wl_fixed_from_double(15 / 0.9));
+  EXPECT_EQ(y, wl_fixed_from_double(26 / 1.6));
 }
 
 TEST_F(TransformTest, GuestToHostFixedCoord_UnscaledWithoutDirectScale) {
@@ -463,7 +466,7 @@ TEST_F(TransformTest, GuestToHostFixedCoord_ScaledWithoutDirectScale) {
 
   sl_transform_guest_to_host_fixed(&ctx, &fake_surface, &coord, 0u);
 
-  EXPECT_EQ(wl_fixed_to_double(coord), 16.0);
+  EXPECT_EQ(coord, wl_fixed_from_double(15 / 0.9));
 }
 
 TEST_F(TransformTest, GuestToHostFixedCoord_UnscaledWithDirectScale) {
@@ -478,16 +481,43 @@ TEST_F(TransformTest, GuestToHostFixedCoord_UnscaledWithDirectScale) {
   EXPECT_EQ(wl_fixed_to_double(coord), 16.0);
 }
 
-TEST_F(TransformTest, GuestToHostFixedCoord_ScaledWithDirectScale) {
+TEST_F(TransformDirectScaleTest, Pointer_WithViewportOverride) {
+  ctx.viewport_resize = true;
+  sl_window* window = CreateToplevelWindow();
+  window->viewport_override = true;
+  window->viewport_pointer_scale = 1.1;
+  sl_host_surface* surface = window->paired_surface;
+  surface->has_own_scale = true;
+  surface->xdg_scale_x = 0.9;
+  surface->xdg_scale_y = 1.6;
+
+  wl_fixed_t x = wl_fixed_from_double(16.0);
+  wl_fixed_t y = wl_fixed_from_double(16.0);
+
+  sl_transform_pointer(&ctx, surface, &x, &y);
+
+  EXPECT_EQ(x, wl_fixed_from_double(0.9 * 16 * 1.1));
+  EXPECT_EQ(y, wl_fixed_from_double(1.6 * 16 * 1.1));
+}
+
+TEST_F(TransformDirectScaleTest, Pointer_WithoutViewportOverride) {
+  ctx.viewport_resize = true;
+  sl_window* window = CreateToplevelWindow();
+  window->viewport_override = false;
+  window->viewport_pointer_scale = 0.9;
+  sl_host_surface* surface = window->paired_surface;
   ctx.use_direct_scale = true;
-  fake_surface.has_own_scale = true;
-  fake_surface.xdg_scale_y = 1.6;
+  surface->has_own_scale = true;
+  surface->xdg_scale_x = 0.9;
+  surface->xdg_scale_y = 1.6;
 
-  wl_fixed_t coord = wl_fixed_from_double(26.0);
+  wl_fixed_t x = wl_fixed_from_double(16.0);
+  wl_fixed_t y = wl_fixed_from_double(16.0);
 
-  sl_transform_guest_to_host_fixed(&ctx, &fake_surface, &coord, 0u);
+  sl_transform_pointer(&ctx, surface, &x, &y);
 
-  EXPECT_EQ(wl_fixed_to_double(coord), 16.0);
+  EXPECT_EQ(x, wl_fixed_from_double(0.9 * 16));
+  EXPECT_EQ(y, wl_fixed_from_double(1.6 * 16));
 }
 }  // namespace sommelier
 }  // namespace vm_tools

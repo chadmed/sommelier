@@ -14,6 +14,7 @@
 
 #include "sommelier.h"                       // NOLINT(build/include_directory)
 #include "sommelier-ctx.h"                   // NOLINT(build/include_directory)
+#include "sommelier-logging.h"               // NOLINT(build/include_directory)
 #include "virtualization/wayland_channel.h"  // NOLINT(build/include_directory)
 
 class FuzzChannel : public WaylandChannel {
@@ -125,7 +126,7 @@ int drain_socket(int fd, uint32_t mask, void* data) {
 int count_fds() {
   DIR* dir = opendir("/proc/self/fd");
   if (!dir) {
-    fprintf(stderr, "Failed to open /proc/self/fd: %m\n");
+    LOG(ERROR) << "failed to open /proc/self/fd: " << strerror(errno);
     abort();
   }
 
@@ -134,16 +135,16 @@ int count_fds() {
 
   // Needed to distinguish between eof and errors.
   errno = 0;
-  while (struct dirent* dirent = readdir(dir)) {
+  while (struct dirent* _ = readdir(dir)) {
     count++;
   }
   if (errno) {
-    fprintf(stderr, "Failed to read from /proc/self/fd: %m\n");
+    LOG(ERROR) << "failed to read from /proc/self/fd: " << strerror(errno);
     abort();
   }
 
   if (closedir(dir)) {
-    fprintf(stderr, "Failed to close /proc/self/fd: %m\n");
+    LOG(ERROR) << "failed to close /proc/self/fd: " << strerror(errno);
     abort();
   }
 
@@ -151,6 +152,7 @@ int count_fds() {
 }
 
 int LLVMFuzzerTestOneInput_real(const uint8_t* data, size_t size) {
+  int ret;
   static Environment env;
   FuzzedDataProvider source(data, size);
 
@@ -165,11 +167,13 @@ int LLVMFuzzerTestOneInput_real(const uint8_t* data, size_t size) {
   // goes to sommelier to listen on/write to, the other end is kept by us. The
   // channel implements send with a no-op, so we don't ever have to read from
   // our end.
-  ctx.host_display = wl_display_create();
+  ret = channel.init();
+  assert(!ret);
+
   struct wl_event_loop* event_loop =
-      wl_display_get_event_loop(ctx.host_display);
-  ctx.channel = &channel;
-  sl_context_init_wayland_channel(&ctx, event_loop, /*display=*/false);
+      sl_context_configure_event_loop(&ctx, &channel,
+                                      /*use_virtual_context=*/true);
+
   // `display` takes ownership of `virtwl_display_fd`
   ctx.display = wl_display_connect_to_fd(ctx.virtwl_display_fd);
 
@@ -178,7 +182,7 @@ int LLVMFuzzerTestOneInput_real(const uint8_t* data, size_t size) {
   // fuzzer. We set up the event loop to drain any data send by sommelier to our
   // end, and write fuzz data to our end in the main loop.
   int sv[2];
-  int ret = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
+  ret = socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv);
   assert(!ret);
   // wl_client takes ownership of its file descriptor
   ctx.client = wl_client_create(ctx.host_display, sv[0]);
@@ -246,7 +250,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
 
   int end_fds = count_fds();
   if (start_fds != end_fds) {
-    fprintf(stderr, "Leaked %d file descriptors!\n", end_fds - start_fds);
+    LOG(ERROR) << "leaked " << end_fds - start_fds << " file descriptors!";
     abort();
   }
 
